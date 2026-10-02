@@ -6,11 +6,13 @@ Priority:
   3. REAL_MARKET (market_service live XAU $4131) — live price + paper P/L until Exness auth succeeds
 No MOCK fake price — all price is LIVE.
 """
-import time, random, logging
+import os, time, random, logging
 from collections import deque
 
 logger = logging.getLogger("klop.mt5")
 
+def _get_bridge_url(): return os.getenv("BRIDGE_URL","").strip().rstrip("/")
+BRIDGE_URL = _get_bridge_url()
 HAS_MT5 = False
 mt5 = None
 try:
@@ -84,6 +86,19 @@ class MT5Service:
         self._real_balance = 0.0
         self._exness_ok = False
 
+
+    def _bridge_request(self, path, method="GET", json=None):
+        if not BRIDGE_URL: return None
+        try:
+            import httpx
+            with httpx.Client(timeout=10) as c:
+                if method=="GET": r=c.get(f"{_get_bridge_url() or BRIDGE_URL}{path}")
+                else: r=c.post(f"{_get_bridge_url() or BRIDGE_URL}{path}", json=json)
+                if r.status_code==200: return r.json()
+        except Exception as e:
+            logger.warning(f"Bridge {path} fail {e}")
+        return None
+
     def is_connected(self): return self._connected
 
     def connect(self, login: int, password: str, server: str):
@@ -91,6 +106,19 @@ class MT5Service:
         self._server = server
         self._password = password
 
+        # 1b. Try BRIDGE (Windows) first if BRIDGE_URL set — REAL without Wine
+        if _get_bridge_url() or BRIDGE_URL:
+            try:
+                import httpx
+                with httpx.Client(timeout=12) as c:
+                    r=c.post(f"{_get_bridge_url() or BRIDGE_URL}/bridge/connect", json={"login":int(login),"password":password,"server":server})
+                    if r.status_code==200:
+                        j=r.json()
+                        if j.get("status")=="success":
+                            self._connected=True; self.mode="BRIDGE"; self._real_balance=float(j.get("balance",0)); self._exness_ok=True
+                            return {"status":"success","message":f"✅ LIVE via BRIDGE — {server} Balance ${j.get('balance',0):.2f} (REAL broker)","mode":"BRIDGE","login":login,"server":server,"balance":j.get("balance")}
+            except Exception as e:
+                logger.warning(f"BRIDGE connect fail {e}")
         # 1. Try NATIVE Wine MT5 first (full REAL)
         if HAS_MT5 and mt5 is not None:
             try:
@@ -159,6 +187,11 @@ class MT5Service:
 
     def get_account_info(self):
         if not self._connected: return None
+        # 0. BRIDGE Windows (100% REAL via BRIDGE_URL)
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request("/bridge/account")
+            if j and "balance" in j:
+                return {"login": j["login"], "server": j["server"], "balance": float(j["balance"]), "equity": float(j["equity"]), "profit": float(j["profit"]), "margin": float(j.get("margin",0)), "leverage": int(j.get("leverage",2000)), "currency": "USD", "mode": "BRIDGE"}
         # 1. NATIVE Wine
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
@@ -190,6 +223,9 @@ class MT5Service:
 
     def get_tick(self, symbol: str):
         sym=symbol.upper().replace("/","")
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request(f"/bridge/tick/{sym}")
+            if j and "bid" in j: return j
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 t=mt5.symbol_info_tick(sym)
@@ -213,6 +249,9 @@ class MT5Service:
 
     def get_candles(self, symbol: str, timeframe: str, count: int):
         sym=symbol.upper()
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request(f"/bridge/candles/{sym}?timeframe={timeframe}&count={count}")
+            if j and j.get("candles"): return j["candles"]
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 tf_map={"M1":mt5.TIMEFRAME_M1,"M5":mt5.TIMEFRAME_M5,"M15":mt5.TIMEFRAME_M15,"H1":mt5.TIMEFRAME_H1}
@@ -235,6 +274,9 @@ class MT5Service:
         return _aggregate_m5(candles_1m, count)
 
     def get_positions(self):
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request("/bridge/positions")
+            if j and "positions" in j: return j["positions"]
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 pos=mt5.positions_get()
@@ -262,6 +304,10 @@ class MT5Service:
 
     def send_order(self, symbol: str, action: str, volume: float, sl=None, tp=None):
         sym=symbol.upper()
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request("/bridge/order", "POST", {"symbol":sym,"action":action,"volume":volume,"sl":sl,"tp":tp})
+            if j and j.get("status")=="success": return {"status":"success","message":f"✅ LIVE BRIDGE {action} {volume} {sym} (REAL broker)","ticket":j.get("ticket"),"mode":"BRIDGE"}
+            if j and j.get("status")=="error": return j
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 tick=mt5.symbol_info_tick(sym)
@@ -285,6 +331,10 @@ class MT5Service:
         return {"status": "success", "message": f"✅ {action} {volume} {sym} @ {entry} — {mode_msg}", "ticket": pos["ticket"], "mode": self.mode}
 
     def close_position(self, ticket: int):
+        if _get_bridge_url() or BRIDGE_URL:
+            j=self._bridge_request(f"/bridge/close/{ticket}","POST",None)
+            if j and j.get("status")=="success": return j
+            if j and j.get("status")=="error": return j
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 poss=mt5.positions_get(ticket=ticket)
