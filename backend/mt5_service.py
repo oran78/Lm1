@@ -329,7 +329,7 @@ class MT5Service:
         entry=tick["ask"] if action=="BUY" else tick["bid"]
         pos={"ticket": int(time.time()*1000)%9000000+1000000, "symbol": sym, "type": action, "volume": float(volume), "price_open": entry, "price_current": entry, "profit": 0.0, "sl": sl or 0, "tp": tp or 0, "time": int(time.time())}
         _mock_positions.append(pos)
-        mode_msg = "EXNESS_API paper (live price)" if self.mode=="EXNESS_API" else "REAL live price (Wine NATIVE for broker fill — see README)"
+        mode_msg = "PAPER on LIVE $4141 price — connect BRIDGE_URL or Wine NATIVE for broker fill" if self.mode=="REAL" else "EXNESS_API paper (live $4141 — need BRIDGE/Wine for broker)"
         return {"status": "success", "message": f"✅ {action} {volume} {sym} @ {entry} — {mode_msg}", "ticket": pos["ticket"], "mode": self.mode}
 
     def close_position(self, ticket: int):

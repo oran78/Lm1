@@ -16,7 +16,7 @@ _cache = {}  # symbol -> {price, time}
 _cache_ttl = 25  # seconds
 
 # Last known good
-_last_price = {"XAUUSD": 2650.0, "EURUSD": 1.0850, "GBPUSD": 1.2720, "USDJPY": 149.5, "BTCUSD": 68500.0}
+_last_price = {"XAUUSD": 4141.7, "EURUSD": 1.0850, "GBPUSD": 1.2720, "USDJPY": 149.5, "BTCUSD": 68500.0}
 
 async def fetch_xau_real():
     """Try multiple free endpoints for LIVE XAUUSD"""
