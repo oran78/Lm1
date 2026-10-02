@@ -85,6 +85,7 @@ class MT5Service:
         self._password = None
         self._real_balance = 0.0
         self._exness_ok = False
+        self._last_error = None
 
 
     def _bridge_request(self, path, method="GET", json=None):
@@ -101,10 +102,11 @@ class MT5Service:
 
     def is_connected(self): return self._connected
 
-    def connect(self, login: int, password: str, server: str):
+    def connect(self, login: int, password: str, server: str, reconnect: bool = False):
         self._login = int(login)
         self._server = server
         self._password = password
+        self._last_error = None
 
         # 1b. Try BRIDGE (Windows) first if BRIDGE_URL set — REAL without Wine
         if _get_bridge_url() or BRIDGE_URL:
