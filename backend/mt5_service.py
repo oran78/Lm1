@@ -38,6 +38,12 @@ try:
 except ImportError:
     HAS_EXNESS = False
     exness_direct = None
+try:
+    from metaapi_service import metaapi_service as _metaapi
+    HAS_METAAPI=True
+except:
+    HAS_METAAPI=False
+    _metaapi=None
 
 # mt5linux: Wine + RPyC + mt5server.exe — the systematic Linux MT5 (github.com/lucas-campagna/mt5linux)
 HAS_MT5LINUX = False
@@ -227,6 +233,12 @@ class MT5Service:
         self._exness_ok=False
 
     def get_account_info(self):
+        # Prefer MetaApi NATIVE if available — this is the professional real bot
+        try:
+            if HAS_METAAPI and _metaapi and _metaapi.is_connected():
+                acc=_metaapi.get_account_info()
+                if acc: return acc
+        except: pass
         if not self._connected: return None
         # 0. BRIDGE Windows (100% REAL via BRIDGE_URL)
         if _get_bridge_url() or BRIDGE_URL:

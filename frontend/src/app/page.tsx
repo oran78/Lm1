@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback } from 'react';
 import TradingChart from '@/components/TradingChart';
 import { apiUrl } from '@/lib/api';
 
-const SERVERS = ['Exness-MT5Real','Exness-MT5Real2','Exness-MT5Real3','Exness-MT5Real4','Exness-MT5Real5','Exness-MT5Trial'];
+const SERVERS = ['Exness-MT5Real','Exness-MT5Real2','Exness-MT5Real3','Exness-MT5Real4','Exness-MT5Real5','Exness-MT5Trial','Exness-MT5Trial6','Exness-MT5Trial9'];
 
 function Pill({children, tone="neutral"}:{children:any,tone?:string}){
   const m:any={ emerald:"bg-emerald-500/10 text-emerald-400 border-emerald-500/20", red:"bg-red-500/10 text-red-400 border-red-500/20", amber:"bg-amber-500/10 text-amber-400 border-amber-500/20", neutral:"bg-zinc-800 text-zinc-400 border-zinc-700" };
@@ -16,7 +16,8 @@ export default function Page(){
   const [tick,setTick]=useState<any>(null); const [candles,setCandles]=useState<any[]>([]); const [analysis,setAnalysis]=useState<any>(null);
   const [positions,setPositions]=useState<any[]>([]); const [history,setHistory]=useState<any[]>([]); const [tab,setTab]=useState<'trade'|'positions'|'history'|'log'>('trade');
   const [wsOk,setWsOk]=useState(false);
-  const [login,setLogin]=useState(''); const [password,setPassword]=useState(''); const [server,setServer]=useState(SERVERS[0]); const [customServer,setCustomServer]=useState(false);
+  const [login,setLogin]=useState(''); const [password,setPassword]=useState(''); const [server,setServer]=useState('Exness-MT5Trial9'); const [customServer,setCustomServer]=useState(false);
+  const [useMetaApi,setUseMetaApi]=useState(true); const [metaToken,setMetaToken]=useState(''); const [metaAccountId,setMetaAccountId]=useState('e9d9517c-8551-4b9e-b53d-2644152');
   const [connecting,setConnecting]=useState(false); const [msg,setMsg]=useState<{t:'ok'|'err';m:string}|null>(null);
   const [bot,setBot]=useState<any>(null);
   const [riskPct,setRiskPct]=useState('3'); const [targetMult,setTargetMult]=useState('2'); const [maxDay,setMaxDay]=useState('12');
@@ -61,11 +62,12 @@ export default function Page(){
   const doConnect=async()=>{
     setConnecting(true); setMsg(null);
     try{
-      const r=await fetch(apiUrl('/api/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login,password,server})});
+      const body:any = useMetaApi ? {use_metaapi:true, metaapi_token: metaToken.trim(), metaapi_account_id: metaAccountId.trim()} : {login,password,server};
+      const r=await fetch(apiUrl('/api/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       const j=await r.json(); if(!r.ok) throw new Error(j.detail||j.message||`HTTP ${r.status}`);
       setMsg({t:'ok',m:j.message}); setConnected(true); setShowConnect(false); fetchAll();
     }catch(e:any){
-      const hint = e.message?.includes('Failed to fetch') ? ' — Railway backend unreachable. Check NEXT_PUBLIC_API_URL on Vercel points to https://lm1-production.up.railway.app' : '';
+      const hint = e.message?.includes('Failed to fetch') ? ' — Railway backend unreachable. Check NEXT_PUBLIC_API_URL = https://lm1-production.up.railway.app' : '';
       setMsg({t:'err',m:e.message+hint});
     }
     setConnecting(false);
@@ -101,8 +103,8 @@ export default function Page(){
   const sc=(s?:string)=> s==='BUY'?'emerald':s==='SELL'?'red':s?.includes('OVER')?'amber':'neutral';
   const flipPct=bot?.stats?.flip_progress??0; const equityCurve=bot?.stats?.equity_curve||[]; const markers=bot?.stats?.markers||[];
 
-  const modeTone = mode==='NATIVE'?'emerald':mode==='BRIDGE'?'emerald':mode==='EXNESS_API'?'amber':mode==='REAL'?'amber':'neutral';
-  const modeLabel = mode==='NATIVE'?'NATIVE (Broker)':mode==='BRIDGE'?'BRIDGE (Windows)':mode==='EXNESS_API'?'EXNESS API (cloudscraper)':mode==='REAL'?'PAPER on LIVE (CF blocked)':'—';
+  const modeTone = mode==='NATIVE'?'emerald':mode==='BRIDGE'?'emerald':mode==='METAAPI'?'emerald':mode==='EXNESS_API'?'amber':mode==='REAL'?'red':'neutral';
+  const modeLabel = mode==='NATIVE'?'NATIVE (mt5linux/Wine)':mode==='BRIDGE'?'BRIDGE (Windows)':mode==='METAAPI'?'METAAPI NATIVE (REAL broker)':mode==='EXNESS_API'?'EXNESS_API':mode==='REAL'?'PAPER on LIVE (CF blocked)':'—';
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-zinc-100 selection:bg-amber-500/30">
@@ -151,14 +153,27 @@ export default function Page(){
               </div>
               <Pill tone="amber">Live XAU {tick ? `$${Number(tick.bid).toFixed(2)}` : '~$4131'}</Pill>
             </div>
-            <div className="grid sm:grid-cols-[1fr_1fr_1fr_auto] gap-3 mt-4">
-              <input value={login} onChange={e=>setLogin(e.target.value)} placeholder="MT5 Login (e.g. 477338841)" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50 placeholder:text-zinc-600"/>
-              <input value={password} onChange={e=>setPassword(e.target.value)} type="password" placeholder="Master password" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50"/>
-              {!customServer ? <select value={server} onChange={e=>setServer(e.target.value)} className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50">{SERVERS.map(s=><option key={s} value={s}>{s}</option>)}</select> : <input value={server} onChange={e=>setServer(e.target.value)} placeholder="Exness-MT5Real" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm"/>}
-              <button onClick={doConnect} disabled={connecting||!login||!password} className="rounded-full bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white font-semibold px-6 py-2.5 text-sm shadow-lg shadow-violet-600/20">{connecting?'Connecting…':'Connect →'}</button>
+            <div className="flex items-center gap-2 mb-3">
+              <button onClick={()=>setUseMetaApi(true)} className={`px-4 py-1.5 rounded-full text-xs font-bold ${useMetaApi?'bg-emerald-500 text-white shadow':'bg-zinc-800 text-zinc-400 border border-zinc-700'}`}>● MetaApi (REAL broker)</button>
+              <button onClick={()=>setUseMetaApi(false)} className={`px-4 py-1.5 rounded-full text-xs font-bold ${!useMetaApi?'bg-violet-600 text-white shadow':'bg-zinc-800 text-zinc-400 border border-zinc-700'}`}>MT5 Direct (BRIDGE/Wine)</button>
+              <span className={`text-[11px] px-2 py-0.5 rounded-full border ${useMetaApi?'bg-emerald-500/10 text-emerald-400 border-emerald-500/20':'bg-zinc-800 text-zinc-500 border-zinc-700'}`}>{useMetaApi?'Switch any day — paste new AccountID':'Needs BRIDGE_URL/Wine'}</span>
             </div>
-            <label className="flex items-center gap-2 mt-3 text-xs text-zinc-500 cursor-pointer"><input type="checkbox" checked={customServer} onChange={e=>setCustomServer(e.target.checked)} className="rounded"/> Custom server (e.g. Exness-MT5Trial)</label>
-            {!connected && tick && <p className="text-xs text-zinc-600 mt-2">Chart is LIVE (gold-api). Connect to see REAL balance — numeric MT5 uses bridge/Wine NATIVE, PA email uses EXNESS API.</p>}
+            {useMetaApi ? (
+              <div className="grid sm:grid-cols-[1.2fr_1fr_auto] gap-3">
+                <input value={metaToken} onChange={e=>setMetaToken(e.target.value)} placeholder="MetaApi Token ey... (from app.metaapi.cloud/token)" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 placeholder:text-zinc-600"/>
+                <input value={metaAccountId} onChange={e=>setMetaAccountId(e.target.value)} placeholder="Account ID e9d9517c-..." className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm font-mono focus:outline-none focus:border-emerald-500/50 placeholder:text-zinc-600"/>
+                <button onClick={doConnect} disabled={connecting||!metaToken||!metaAccountId} className="rounded-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-950 font-black px-6 py-2.5 text-sm shadow-lg">{connecting?'Connecting…':'Connect MetaApi →'}</button>
+              </div>
+            ) : (
+              <div className="grid sm:grid-cols-[1fr_1fr_1fr_auto] gap-3">
+                <input value={login} onChange={e=>setLogin(e.target.value)} placeholder="MT5 Login (e.g. 477338841)" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50 placeholder:text-zinc-600"/>
+                <input value={password} onChange={e=>setPassword(e.target.value)} type="password" placeholder="Master password" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50"/>
+                {!customServer ? <select value={server} onChange={e=>setServer(e.target.value)} className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50">{SERVERS.map(s=><option key={s} value={s}>{s}</option>)}</select> : <input value={server} onChange={e=>setServer(e.target.value)} placeholder="Exness-MT5Real" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm"/>}
+                <button onClick={doConnect} disabled={connecting||!login||!password} className="rounded-full bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white font-semibold px-6 py-2.5 text-sm shadow-lg">{connecting?'Connecting…':'Connect →'}</button>
+              </div>
+            )}
+            {!useMetaApi && <label className="flex items-center gap-2 mt-3 text-xs text-zinc-500 cursor-pointer"><input type="checkbox" checked={customServer} onChange={e=>setCustomServer(e.target.checked)} className="rounded"/> Custom server (e.g. Exness-MT5Trial9)</label>}
+            {useMetaApi ? <p className="text-xs text-emerald-400 mt-2">✅ MetaApi = <b>NATIVE REAL</b> on Railway — no Wine needed. Get Token at <span className="underline">app.metaapi.cloud/token</span>, paste AccountID from Deployed card. Switch account any day by pasting new ID here.</p> : (!connected && tick ? <p className="text-xs text-zinc-600 mt-2">Chart is LIVE (gold-api). MT5 Direct needs BRIDGE_URL/Wine for NATIVE.</p> : null)}
           </div>
         )}
 
