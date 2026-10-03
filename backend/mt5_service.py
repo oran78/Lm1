@@ -45,14 +45,11 @@ except:
     HAS_METAAPI=False
     _metaapi=None
 
-# mt5linux: Wine + RPyC + mt5server.exe — the systematic Linux MT5 (github.com/lucas-campagna/mt5linux)
+# mt5linux: Wine + RPyC + mt5server.exe — lazy import (broken on py3.11, avoid crash at startup)
 HAS_MT5LINUX = False
-mt5linux = None  # will hold MetaTrader5(host=localhost,port=8001) connection
-try:
-    from mt5linux import MetaTrader5 as MT5Linux
-    HAS_MT5LINUX = True
-except ImportError:
-    MT5Linux = None
+mt5linux = None
+MT5Linux = None
+# Do NOT import mt5linux at load — it SyntaxErrors on 3.11 line 1755. Import lazily inside connect()
 
 _mock_positions = []
 _mock_history = deque(maxlen=80)
@@ -136,8 +133,13 @@ class MT5Service:
                             return {"status":"success","message":f"✅ LIVE via BRIDGE — {server} Balance ${j.get('balance',0):.2f} (REAL broker)","mode":"BRIDGE","login":login,"server":server,"balance":j.get("balance")}
             except Exception as e:
                 logger.warning(f"BRIDGE connect fail {e}")
-        # 1a. Try BRIDGE already done above — next: mt5linux (Wine RPyC) — the PROVEN Linux MT5
-        if HAS_MT5LINUX and MT5Linux is not None:
+        # 1a. Lazy mt5linux import — if mt5linux SyntaxError we skip NATIVE and go PAPER/MetaApi
+        try:
+            from mt5linux import MetaTrader5 as _MT5LinuxLazy
+            _has = True
+        except Exception as _e:
+            _MT5LinuxLazy = None; _has = False
+        if _has and _MT5LinuxLazy is not None:
             try:
                 import socket as _sock
                 # check mt5server.exe RPyC port
@@ -145,7 +147,7 @@ class MT5Service:
                 _s.settimeout(1.5)
                 _s.connect(("127.0.0.1", 8001))
                 _s.close()
-                _mt5l = MT5Linux(host="127.0.0.1", port=8001)
+                _mt5l = _MT5LinuxLazy(host="127.0.0.1", port=8001)
                 # mt5linux needs initialize(login,password,server)
                 if _mt5l.initialize(login=int(login), password=password, server=server):
                     acc = _mt5l.account_info()

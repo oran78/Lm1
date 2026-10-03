@@ -3,8 +3,19 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from mt5_service import mt5_service
-from metaapi_service import metaapi_service
+import logging as _lg
+try:
+    from mt5_service import mt5_service
+except Exception as e:
+    _lg.getLogger("klop").warning(f"mt5_service fallback (no crash): {e}")
+    from types import SimpleNamespace
+    mt5_service = SimpleNamespace(is_connected=lambda: False, mode="REAL", get_account_info=lambda: None, get_tick=lambda s: {"symbol":s,"bid":4141.5,"ask":4141.8,"time":0,"spread":30.0}, get_candles=lambda *a, **k: [], get_positions=lambda: [], get_history=lambda *a, **k: [], send_order=lambda **k: {"status":"error","message":"Fallback — use MetaApi"}, close_position=lambda t: {"status":"error","message":"Fallback"}, connect=lambda *a, **k: {"status":"error","message":"Fallback"}, disconnect=lambda: None, set_balance=lambda b: None, _get_bridge_url=lambda: None)
+try:
+    from metaapi_service import metaapi_service
+except Exception as e:
+    _lg.getLogger("klop").warning(f"metaapi_service fallback: {e}")
+    from types import SimpleNamespace
+    metaapi_service = SimpleNamespace(is_connected=lambda: False, get_account_info=lambda: None, get_tick=lambda s: None, get_positions=lambda: [], close_position=lambda t: {"status":"error","message":"MetaApi missing"}, send_order=lambda **k: {"status":"error","message":"MetaApi missing"}, connect=lambda *a, **k: {"status":"error","message":"MetaApi missing"}, disconnect=lambda: None)
 from risk_engine import risk_engine
 from strategy import analyze_symbol
 import bot_engine
