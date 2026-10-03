@@ -106,15 +106,15 @@ bot_config = {
     "max_trades_per_day": 12,
     "auto_lot": True,
     "fixed_lot": 0.01,
-    "sl_atr_mult": 1.2,            # SL distance = 1.2 x ATR
-    "tp_atr_mult": 1.8,            # TP distance = 1.8 x ATR  -> R:R 1.5
+    "sl_atr_mult": 1.0,            # SL distance = 1.2 x ATR
+    "tp_atr_mult": 1.5,            # TP distance = 1.8 x ATR  -> R:R 1.5
     "timeframe": "M5",
     "session_filter": True,
     "max_hold_candles": 12,        # time-stop: close a trade that goes nowhere after N candles
     "close_on_opposite": True,
     "max_spread_points": 35,       # absolute spread cap (points = price*100); strategy also caps at 0.5 x ATR
     "be_enabled": True,            # auto break-even
-    "be_trigger_r": 1.0,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
+    "be_trigger_r": 0.8,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
 }
 
 bot_stats = {

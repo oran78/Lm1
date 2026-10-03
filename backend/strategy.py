@@ -110,11 +110,11 @@ def _session_ok(now=None):
 
 
 # ---------------------------------------------------------------------------------------------- tunables
-CHOP_ATR_FRAC = 0.3        # |EMA9-EMA21| below this fraction of ATR  => CHOP
+CHOP_ATR_FRAC = 0.25        # |EMA9-EMA21| below this fraction of ATR  => CHOP
 SLOPE_BARS = 3             # EMA21 angle is measured over this many closed candles
-RSI_BAND = (42.0, 58.0)    # RSI must cool into this band during the pullback
+RSI_BAND = (38.0, 62.0)    # Pro Scalper: flexible pullback band    # RSI must cool into this band during the pullback
 RSI_LOOKBACK = 3           # ...measured over the last N closed candles
-APPROACH_ATR = 0.75        # price within this many ATR of the zone counts as "pulling back"
+APPROACH_ATR = 0.85        # Pro Scalper: rapid approach zone        # price within this many ATR of the zone counts as "pulling back"
 SWING_BARS = 3             # swing window = pullback candle(s) + trigger candle
 MAX_SPREAD_ATR = 0.5       # spread veto relative to ATR
 MIN_RR = 1.5
@@ -189,9 +189,17 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     if gap < CHOP_ATR_FRAC * atr:
         return {**out, "state": "CHOP", "reason": f"CHOP — EMA gap {gap:.2f} < {CHOP_ATR_FRAC} × ATR {atr:.2f} • no trade"}
 
+    # Pro Scalper Macro Trend Filter: compute EMA50 if enough candles
+    ema50 = _ema(closes, 50) if len(closes) >= 50 else None
+    out["ema50"] = round(ema50, 2) if ema50 else None
+
     if ema9 > ema21 and slope > 0:
+        if ema50 and last["close"] < ema50:
+            return {**out, "state": "NO_TREND", "reason": "Bullish momentum but price below EMA50 trend filter — skipping"}
         side = "BUY"
     elif ema9 < ema21 and slope < 0:
+        if ema50 and last["close"] > ema50:
+            return {**out, "state": "NO_TREND", "reason": "Bearish momentum but price above EMA50 trend filter — skipping"}
         side = "SELL"
     else:
         return {**out, "state": "NO_TREND", "reason": "EMAs aligned but EMA21 is not sloping with the trend — no bias"}
@@ -258,20 +266,22 @@ def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, t
     return {"sl": round(sl, 2), "tp": round(tp, 2), "risk": risk, "reward": reward, "rr": round(reward / risk, 2)}, "ok"
 
 
-def break_even_sl(side, entry, sl, bid, ask, trigger_r=1.0):
+def break_even_sl(side, entry, sl, bid, ask, trigger_r=1.0, lock_buffer=False):
     """
-    New stop-loss price once floating profit >= trigger_r * initial risk, else None.
-    BUY -> entry + spread, SELL -> entry - spread. Returns None when the stop is already at/after entry.
+    Pro Scalper Auto Break-Even.
+    Triggers when floating profit >= trigger_r * initial risk (default 0.8R).
+    BUY -> entry + spread (+ optional micro buffer), SELL -> entry - spread.
     """
     if not sl or not entry:
         return None
     spread_px = max(ask - bid, 0.0)
+    buffer_px = max(0.08, spread_px * 0.25) if lock_buffer else 0.0
     if side == "BUY":
         risk = entry - sl
         if risk <= 0:
             return None
-        return round(entry + spread_px, 2) if (bid - entry) >= trigger_r * risk else None
+        return round(entry + spread_px + buffer_px, 2) if (bid - entry) >= trigger_r * risk else None
     risk = sl - entry
     if risk <= 0:
         return None
-    return round(entry - spread_px, 2) if (entry - ask) >= trigger_r * risk else None
+    return round(entry - spread_px - buffer_px, 2) if (entry - ask) >= trigger_r * risk else None

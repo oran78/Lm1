@@ -68,7 +68,7 @@ export default function Page() {
 
   // bot form
   const [riskPct, setRiskPct] = useState('1'); const [targetMult, setTargetMult] = useState('2'); const [maxDay, setMaxDay] = useState('12');
-  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.2'); const [tpAtr, setTpAtr] = useState('1.8');
+  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.0'); const [tpAtr, setTpAtr] = useState('1.5');
   const [botTf, setBotTf] = useState<TF>('M5'); const [session, setSession] = useState(true); const [flipMode, setFlipMode] = useState(true);
   const [manualLot, setManualLot] = useState('0.01'); const [attachSlTp, setAttachSlTp] = useState(true); const [trading, setTrading] = useState(false);
   const hydrated = useRef(false);
