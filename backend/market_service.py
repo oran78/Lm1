@@ -13,7 +13,7 @@ logger = logging.getLogger("klop.market")
 
 # In-memory cache to avoid rate limits
 _cache = {}  # symbol -> {price, time}
-_cache_ttl = 25  # seconds
+_cache_ttl = 3  # seconds (was 25 — far too stale for scalping)
 
 # Last known good
 _last_price = {"XAUUSD": 4141.7, "EURUSD": 1.0850, "GBPUSD": 1.2720, "USDJPY": 149.5, "BTCUSD": 68500.0}
@@ -67,10 +67,7 @@ def get_live_price_sync(symbol: str) -> float:
     now = time.time()
     sym = symbol.upper()
     if sym in _cache and now - _cache[sym]["t"] < _cache_ttl:
-        # add micro jitter to simulate live tick
-        base = _cache[sym]["price"]
-        jitter = 0.35 if "XAU" in sym else 0.00008
-        return base + random.uniform(-jitter, jitter)
+        return _cache[sym]["price"]
 
     price = None
     try:
@@ -106,9 +103,26 @@ def get_live_price_sync(symbol: str) -> float:
     if price and price > 0:
         _last_price[sym] = price
         _cache[sym] = {"price": price, "t": now}
-        return price + random.uniform(-0.15, 0.15) if "XAU" in sym else price
+        return price
 
-    # fallback jitter on last known
-    last = _last_price.get(sym, 2650.0 if "XAU" in sym else 1.085)
-    jitter = 0.45 if "XAU" in sym else 0.0001
-    return last + random.uniform(-jitter, jitter)
+    # fetch failed: return last known REAL price unchanged (never fabricate noise)
+    return _last_price.get(sym, 0.0)
+
+
+def fetch_history_1m(limit: int = 500):
+    """
+    Real 1-minute history for gold from Binance PAXGUSDT (gold-backed token, tracks XAU closely).
+    Returns [{time,open,high,low,close,volume}] oldest->newest, or [] if unreachable.
+    The still-forming candle is the last element.
+    """
+    try:
+        with httpx.Client(timeout=6) as c:
+            r = c.get("https://api.binance.com/api/v3/klines",
+                      params={"symbol": "PAXGUSDT", "interval": "1m", "limit": limit})
+            if r.status_code != 200:
+                return []
+            return [{"time": int(k[0] // 1000), "open": float(k[1]), "high": float(k[2]),
+                     "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in r.json()]
+    except Exception as e:
+        logger.warning(f"history fetch failed: {e}")
+        return []

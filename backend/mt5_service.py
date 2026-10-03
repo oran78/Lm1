@@ -53,40 +53,58 @@ MT5Linux = None
 
 _mock_positions = []
 _mock_history = deque(maxlen=80)
-_candle_cache = {}
+_candle_cache = {}    # symbol -> deque of REAL 1-minute candles
+_candle_source = {}   # symbol -> "PAXG-history+live" | "live-ticks"
+_paper_ticket = [1000000]
+_TF_SECS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}
+
+def _bucket(candles_1m, secs, count):
+    """Aggregate 1m candles into clock-aligned buckets (v2.2 grouped by index, so M5 bars were misaligned)."""
+    out, cur = [], None
+    for c in candles_1m:
+        b = c["time"] // secs * secs
+        if cur is None or cur["time"] != b:
+            cur = {"time": b, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]}
+            out.append(cur)
+        else:
+            cur["high"] = max(cur["high"], c["high"]); cur["low"] = min(cur["low"], c["low"])
+            cur["close"] = c["close"]; cur["volume"] += c["volume"]
+    return out[-count:]
 
 def _ensure_candles(symbol: str, count: int = 100):
-    now = int(time.time())
-    key = symbol.upper()
+    """
+    REAL data only. v2.2 seeded 400 RANDOM-WALK candles, so every indicator/signal was computed on fake history.
+    Now: seed from real Binance PAXG 1m klines (shifted to match spot), then extend with live ticks.
+    If no history is reachable the series starts empty and grows from live ticks (bot waits for warm-up).
+    """
+    key = symbol.upper(); now = int(time.time())
+    live = get_live_price_sync(key) if (HAS_MARKET and get_live_price_sync) else None
     if key not in _candle_cache:
-        base = get_live_price_sync(key) if HAS_MARKET and get_live_price_sync else 4131.5
-        dq = deque(maxlen=400)
-        t = now - 400*60
-        for i in range(400):
-            base += random.uniform(-0.25, 0.35) if "XAU" in key else random.uniform(-0.00007, 0.00007)
-            dq.append({"time": t + i*60, "open": round(base,2), "high": round(base+random.uniform(0,0.5),2), "low": round(base-random.uniform(0,0.5),2), "close": round(base,2), "volume": random.randint(80,400)})
+        dq = deque(maxlen=1500); _candle_source[key] = "live-ticks"
+        if "XAU" in key and HAS_MARKET:
+            try:
+                from market_service import fetch_history_1m
+                hist = fetch_history_1m(500)
+            except Exception:
+                hist = []
+            if hist:
+                if live and live > 100:
+                    off = live - hist[-1]["close"]   # remove PAXG-vs-spot basis
+                    for h in hist:
+                        for f in ("open", "high", "low", "close"):
+                            h[f] = round(h[f] + off, 2)
+                dq.extend(hist); _candle_source[key] = "PAXG-history+live"
         _candle_cache[key] = dq
     dq = _candle_cache[key]
-    last = dq[-1] if dq else None
-    live = get_live_price_sync(key) if HAS_MARKET and get_live_price_sync else (4131.5 + random.uniform(-1,1))
-    cur_min = (now // 60)*60
-    if not last or cur_min != (last["time"]//60*60):
-        dq.append({"time": cur_min, "open": round(live,2), "high": round(live,2), "low": round(live,2), "close": round(live,2), "volume": random.randint(80,400)})
+    if not live or live <= 0:
+        return list(dq)
+    cur_min = now // 60 * 60
+    if not dq or dq[-1]["time"] < cur_min:
+        dq.append({"time": cur_min, "open": round(live, 2), "high": round(live, 2), "low": round(live, 2), "close": round(live, 2), "volume": 1})
     else:
-        last["close"] = round(live,2)
-        last["high"] = max(last["high"], last["close"])
-        last["low"] = min(last["low"], last["close"])
-        last["volume"] += random.randint(5,20)
+        last = dq[-1]
+        last["close"] = round(live, 2); last["high"] = max(last["high"], last["close"]); last["low"] = min(last["low"], last["close"]); last["volume"] += 1
     return list(dq)
-
-def _aggregate_m5(candles_1m, count=100):
-    if not candles_1m: return []
-    out=[]
-    for i in range(0, len(candles_1m), 5):
-        ch=candles_1m[i:i+5]
-        if not ch: continue
-        out.append({"time": ch[0]["time"], "open": ch[0]["open"], "high": max(c["high"] for c in ch), "low": min(c["low"] for c in ch), "close": ch[-1]["close"], "volume": sum(c["volume"] for c in ch)})
-    return out[-count:]
 
 class MT5Service:
     def __init__(self):
@@ -266,17 +284,9 @@ class MT5Service:
                 bal=exness_direct.get_real_balance(self._login)
                 if bal is not None: self._real_balance=float(bal)
             except: pass
-        # 3. REAL — live P/L from live price
-        pos_pnl=0
-        if _mock_positions and HAS_MARKET and get_live_price_sync:
-            for p in _mock_positions:
-                try:
-                    live=get_live_price_sync(p["symbol"])
-                    side=1 if p["type"]=="BUY" else -1
-                    p["price_current"]=round(live,2)
-                    p["profit"]=round((live-p["price_open"])*side*p["volume"]*100,2)
-                except: pass
-            pos_pnl=sum(p.get("profit",0) for p in _mock_positions)
+        # 3. PAPER — bid/ask-based P/L + SL/TP enforcement
+        self._paper_check_exits()
+        pos_pnl=sum(p.get("profit",0) for p in _mock_positions)
         # Determine mode label for honesty
         bal=self._real_balance if self._real_balance else 0.0
         # In REAL without balance sync, bal is 0 — frontend will show Sync bar, but we label REAL not MOCK
@@ -296,10 +306,11 @@ class MT5Service:
         if HAS_MARKET and get_live_price_sync:
             try:
                 price=get_live_price_sync(sym)
+                if not price or price<=0: return None
                 spread=0.30 if "XAU" in sym else 0.00013
                 return {"symbol": sym, "bid": round(price,2 if "XAU" in sym else 5), "ask": round(price+spread,2 if "XAU" in sym else 5), "time": int(time.time()), "spread": round(spread*100,1) if "XAU" in sym else 1.3}
             except: pass
-        return {"symbol": sym, "bid": 4131.5, "ask": 4131.8, "time": int(time.time()), "spread": 30.0}
+        return None   # never invent a price — v2.2 returned a hard-coded 4131.5 here
 
     def get_symbols(self):
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
@@ -323,17 +334,13 @@ class MT5Service:
                     return [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"]), "volume": int(r["tick_volume"])} for r in rates]
             except Exception as e: logger.warning(f"NATIVE candles fail {e}")
         candles_1m=_ensure_candles(sym, 600)
-        if timeframe=="M1": return candles_1m[-count:]
-        if timeframe=="M5": return _aggregate_m5(candles_1m, count)
-        if timeframe=="M15":
-            m5=_aggregate_m5(candles_1m, 500)
-            out=[]
-            for i in range(0,len(m5),3):
-                ch=m5[i:i+3]
-                if not ch: continue
-                out.append({"time": ch[0]["time"], "open": ch[0]["open"], "high": max(c["high"] for c in ch), "low": min(c["low"] for c in ch), "close": ch[-1]["close"], "volume": sum(c["volume"] for c in ch)})
-            return out[-count:]
-        return _aggregate_m5(candles_1m, count)
+        return _bucket(candles_1m, _TF_SECS.get(timeframe, 300), count)
+
+    def get_candle_source(self, symbol: str):
+        """'BROKER' when candles come from MT5/bridge, else where the fallback data came from."""
+        if _get_bridge_url() or BRIDGE_URL or (HAS_MT5 and self.mode=="NATIVE" and mt5 is not None):
+            return "BROKER"
+        return _candle_source.get(symbol.upper(), "none")
 
     def get_positions(self):
         if _get_bridge_url() or BRIDGE_URL:
@@ -344,14 +351,7 @@ class MT5Service:
                 pos=mt5.positions_get()
                 if pos is not None: return [{"ticket": p.ticket, "symbol": p.symbol, "type": "BUY" if p.type==0 else "SELL", "volume": p.volume, "price_open": p.price_open, "price_current": p.price_current, "profit": p.profit, "sl": p.sl, "tp": p.tp, "time": int(p.time)} for p in pos]
             except: pass
-        if HAS_MARKET and get_live_price_sync and _mock_positions:
-            for p in _mock_positions:
-                try:
-                    live=get_live_price_sync(p["symbol"])
-                    side=1 if p["type"]=="BUY" else -1
-                    p["profit"]=round((live-p["price_open"])*side*p["volume"]*100,2)
-                    p["price_current"]=round(live,2)
-                except: pass
+        self._paper_check_exits()
         return list(_mock_positions)
 
     def get_history(self, days: int=7):
@@ -384,13 +384,39 @@ class MT5Service:
                 if res.retcode in (mt5.TRADE_RETCODE_DONE, 10009): return {"status": "success", "message": f"✅ LIVE BROKER {action} {volume} {sym} @ {price}", "ticket": res.order, "mode": "NATIVE"}
                 return {"status": "error", "message": f"Broker reject {res.retcode}: {res.comment}"}
             except Exception as e: return {"status": "error", "message": str(e)}
-        # EXNESS_DIRECT / REAL: live price paper until Wine, but NO fake — it's live P/L on live XAU
+        # PAPER on live price: BUY fills at ask, SELL at bid
         tick=self.get_tick(sym)
         entry=tick["ask"] if action=="BUY" else tick["bid"]
-        pos={"ticket": int(time.time()*1000)%9000000+1000000, "symbol": sym, "type": action, "volume": float(volume), "price_open": entry, "price_current": entry, "profit": 0.0, "sl": sl or 0, "tp": tp or 0, "time": int(time.time())}
+        if sl and tp:
+            if action=="BUY" and not (sl<entry<tp): return {"status":"error","message":f"Invalid SL/TP for BUY @ {entry}"}
+            if action=="SELL" and not (tp<entry<sl): return {"status":"error","message":f"Invalid SL/TP for SELL @ {entry}"}
+        _paper_ticket[0]+=1
+        pos={"ticket": _paper_ticket[0], "symbol": sym, "type": action, "volume": float(volume), "price_open": entry, "price_current": entry, "profit": 0.0, "sl": sl or 0, "tp": tp or 0, "time": int(time.time())}
         _mock_positions.append(pos)
-        mode_msg = "PAPER on LIVE $4141 price — connect BRIDGE_URL or Wine NATIVE for broker fill" if self.mode=="REAL" else "EXNESS_API paper (live $4141 — need BRIDGE/Wine for broker)"
-        return {"status": "success", "message": f"✅ {action} {volume} {sym} @ {entry} — {mode_msg}", "ticket": pos["ticket"], "mode": self.mode}
+        return {"status": "success", "message": f"📝 PAPER {action} {volume} {sym} @ {entry} (simulated — no broker connected)", "ticket": pos["ticket"], "mode": self.mode}
+
+    def _paper_close(self, p, price):
+        side=1 if p["type"]=="BUY" else -1
+        p["profit"]=round((price-p["price_open"])*side*p["volume"]*100,2)
+        p["price_current"]=round(price,2)
+        _mock_positions[:] = [x for x in _mock_positions if x["ticket"]!=p["ticket"]]
+        _mock_history.append({**p, "closed_at": int(time.time())})
+        self._real_balance = round(self._real_balance + p["profit"], 2)   # v2.2 never updated balance
+        return p["profit"]
+
+    def _paper_check_exits(self):
+        """Paper positions had NO SL/TP enforcement in v2.2 — they never closed on their own."""
+        for p in list(_mock_positions):
+            t=self.get_tick(p["symbol"])
+            if not t: continue
+            if p["type"]=="BUY":
+                px=t["bid"]; p["profit"]=round((px-p["price_open"])*p["volume"]*100,2); p["price_current"]=px
+                if p.get("sl") and px<=p["sl"]: self._paper_close(p, p["sl"])
+                elif p.get("tp") and px>=p["tp"]: self._paper_close(p, p["tp"])
+            else:
+                px=t["ask"]; p["profit"]=round((p["price_open"]-px)*p["volume"]*100,2); p["price_current"]=px
+                if p.get("sl") and px>=p["sl"]: self._paper_close(p, p["sl"])
+                elif p.get("tp") and px<=p["tp"]: self._paper_close(p, p["tp"])
 
     def close_position(self, ticket: int):
         if _get_bridge_url() or BRIDGE_URL:
@@ -413,15 +439,10 @@ class MT5Service:
             except Exception as e: return {"status": "error", "message": str(e)}
         found=[p for p in _mock_positions if p["ticket"]==ticket]
         if found:
-            p=found[0]
-            try:
-                live=get_live_price_sync(p["symbol"]) if HAS_MARKET and get_live_price_sync else p["price_current"]
-                side=1 if p["type"]=="BUY" else -1
-                p["profit"]=round((live-p["price_open"])*side*p["volume"]*100,2)
-            except: pass
-            _mock_positions[:] = [x for x in _mock_positions if x["ticket"]!=ticket]
-            _mock_history.append({**p, "closed_at": int(time.time())})
-            return {"status": "success", "message": f"Closed {ticket} P/L ${p.get('profit',0):.2f} (live price)", "profit": p.get('profit',0)}
+            p=found[0]; t=self.get_tick(p["symbol"])
+            px=t["bid"] if p["type"]=="BUY" else t["ask"]
+            profit=self._paper_close(p, px)
+            return {"status": "success", "message": f"Closed {ticket} P/L ${profit:.2f}", "profit": profit}
         return {"status": "error", "message": "Ticket not found"}
 
 mt5_service = MT5Service()

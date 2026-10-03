@@ -1,42 +1,78 @@
 'use client';
 import { useEffect, useRef } from 'react';
-export default function TradingChart({ data, markers }: { data: any[]; markers?: any[] }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const markersRef = useRef<any[]>([]);
+
+type Candle = { time: number; open: number; high: number; low: number; close: number };
+type Marker = { time: number; type: string; lot?: number };
+
+/** Candlestick chart. Created once; data/markers are pushed in place so the chart never flickers on refresh.
+ *  Change `resetKey` (symbol / timeframe) to re-fit the view. Times are UTC. */
+export default function TradingChart({ data, markers, resetKey, height = 420 }: { data: Candle[]; markers?: Marker[]; resetKey?: string; height?: number }) {
+  const host = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<any>(null);
+  const seriesRef = useRef<any>(null);
+  const latest = useRef({ data, markers, resetKey });
+  const fittedFor = useRef<string | undefined>(undefined);
+  latest.current = { data, markers, resetKey };
+
+  const push = () => {
+    const series = seriesRef.current, chart = chartRef.current;
+    if (!series || !chart) return;
+    const { data, markers, resetKey } = latest.current;
+    const seen = new Map<number, Candle>();
+    (data || []).forEach(c => seen.set(c.time, c));
+    const rows = Array.from(seen.values()).sort((a, b) => a.time - b.time);
+    series.setData(rows.map(c => ({ time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close })));
+    // arrows: attach each marker to the candle it happened in
+    const mk: any[] = [];
+    (markers || []).forEach(m => {
+      let t = -1;
+      for (const c of rows) { if (c.time <= m.time) t = c.time; else break; }
+      if (t < 0) return;
+      const buy = m.type === 'BUY';
+      mk.push({ time: t as any, position: buy ? 'belowBar' : 'aboveBar', color: buy ? '#34d399' : '#f87171', shape: buy ? 'arrowUp' : 'arrowDown', text: `${m.type}${m.lot ? ' ' + m.lot : ''}` });
+    });
+    mk.sort((a, b) => a.time - b.time);
+    try { series.setMarkers(mk); } catch {}
+    if (rows.length && fittedFor.current !== resetKey) { chart.timeScale().fitContent(); fittedFor.current = resetKey; }
+  };
+
   useEffect(() => {
-    markersRef.current = markers || [];
-  }, [markers]);
-  useEffect(() => {
-    if (!ref.current || !data?.length) return;
-    let chart: any, series: any, disposed=false;
+    let disposed = false; let ro: ResizeObserver | undefined;
     (async () => {
-      const { createChart, ColorType } = await import('lightweight-charts');
-      if (disposed || !ref.current) return;
-      ref.current.innerHTML='';
-      chart = createChart(ref.current, {
-        layout: { background: { type: ColorType.Solid, color: '#18181b' }, textColor: '#a1a1aa' },
-        grid: { vertLines: { color: '#27272a' }, horzLines: { color: '#27272a' } },
-        width: ref.current.clientWidth, height: 380,
-        timeScale: { borderColor: '#27272a' },
-        rightPriceScale: { borderColor: '#27272a' },
+      const lw: any = await import('lightweight-charts');
+      if (disposed || !host.current) return;
+      const chart = lw.createChart(host.current, {
+        width: host.current.clientWidth, height,
+        layout: { background: { type: lw.ColorType.Solid, color: 'transparent' }, textColor: '#8b8b98', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11 },
+        grid: { vertLines: { color: 'rgba(255,255,255,0.025)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+        crosshair: { mode: lw.CrosshairMode.Normal },
+        timeScale: { borderColor: 'rgba(255,255,255,0.08)', timeVisible: true, secondsVisible: false, rightOffset: 6 },
+        rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)', scaleMargins: { top: 0.1, bottom: 0.12 } },
       });
-      series = chart.addCandlestickSeries({ upColor: '#22c55e', downColor: '#ef4444', borderVisible:false, wickUpColor:'#22c55e', wickDownColor:'#ef4444' });
-      const mapped = data.map((c:any)=>({ time: c.time, open:c.open, high:c.high, low:c.low, close:c.close }));
-      series.setData(mapped);
-      // markers overlay (BUY/SELL arrows)
-      const mks = (markersRef.current||[]).map((m:any)=>{
-        // find closest candle index
-        let idx = data.findIndex((c:any)=> Math.abs(c.time - m.time) < 600);
-        if (idx<0) idx = data.length-1;
-        const t = data[idx]?.time || m.time;
-        return { time: t, position: m.type==='BUY'?'belowBar':'aboveBar', color: m.type==='BUY'?'#22c55e':'#ef4444', shape: m.type==='BUY'?'arrowUp':'arrowDown', text: `${m.type} ${m.lot||''}`.trim() };
+      const series = chart.addCandlestickSeries({
+        upColor: '#34d399', downColor: '#f87171', borderVisible: false, wickUpColor: '#34d399', wickDownColor: '#f87171',
       });
-      if (mks.length) try { series.setMarkers(mks); } catch {}
-      chart.timeScale().fitContent();
-      const ro=new ResizeObserver(()=>{ if(chart&&ref.current) chart.applyOptions({width:ref.current.clientWidth}); });
-      ro.observe(ref.current);
+      chartRef.current = chart; seriesRef.current = series;
+      ro = new ResizeObserver(() => { if (host.current) chart.applyOptions({ width: host.current.clientWidth }); });
+      ro.observe(host.current);
+      fittedFor.current = undefined;
+      push();
     })();
-    return ()=>{ disposed=true; try{chart?.remove();}catch{} };
-  }, [data, markers]);
-  return <div ref={ref} className="w-full rounded-xl overflow-hidden border border-zinc-800 bg-zinc-900" />;
+    return () => { disposed = true; ro?.disconnect(); try { chartRef.current?.remove(); } catch {} chartRef.current = null; seriesRef.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [height]);
+
+  useEffect(() => { push(); }); // cheap: runs after every render, setData is incremental
+
+  return (
+    <div className="relative">
+      <div ref={host} style={{ height }} className="w-full" />
+      {(!data || data.length === 0) && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-zinc-500">
+          <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-amber-400" />
+          Waiting for candles…
+        </div>
+      )}
+    </div>
+  );
 }

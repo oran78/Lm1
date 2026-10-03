@@ -1,303 +1,381 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import TradingChart from '@/components/TradingChart';
-import { apiUrl } from '@/lib/api';
+import XauHero, { XauStatus } from '@/components/XauHero';
+import { get, post, wsUrl } from '@/lib/api';
 
-const SERVERS = ['Exness-MT5Real','Exness-MT5Real2','Exness-MT5Real3','Exness-MT5Real4','Exness-MT5Real5','Exness-MT5Trial','Exness-MT5Trial6','Exness-MT5Trial9'];
+const SERVERS = ['Exness-MT5Real', 'Exness-MT5Real2', 'Exness-MT5Real3', 'Exness-MT5Real4', 'Exness-MT5Real5', 'Exness-MT5Trial', 'Exness-MT5Trial6', 'Exness-MT5Trial9'];
+const SYMBOLS = ['XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY'];
+const TFS = ['M1', 'M5', 'M15', 'H1'] as const;
+type TF = typeof TFS[number];
 
-function Pill({children, tone="neutral"}:{children:any,tone?:string}){
-  const m:any={ emerald:"bg-emerald-500/10 text-emerald-400 border-emerald-500/20", red:"bg-red-500/10 text-red-400 border-red-500/20", amber:"bg-amber-500/10 text-amber-400 border-amber-500/20", neutral:"bg-zinc-800 text-zinc-400 border-zinc-700" };
-  return <span className={`inline-flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-full border font-medium ${m[tone]||m.neutral}`}>{children}</span>;
+const money = (n: any, d = 2) => (typeof n === 'number' && isFinite(n) ? n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) : '—');
+const signed = (n: any) => (typeof n === 'number' && isFinite(n) ? `${n >= 0 ? '+' : '−'}$${Math.abs(n).toFixed(2)}` : '—');
+const tone = (n: any) => (typeof n === 'number' && n < 0 ? 'text-rose-400' : 'text-emerald-400');
+
+function usePoll(fn: () => Promise<void>, ms: number, deps: any[]) {
+  useEffect(() => {
+    let off = false;
+    const run = async () => { if (off || (typeof document !== 'undefined' && document.hidden)) return; try { await fn(); } catch {} };
+    run();
+    const id = setInterval(run, ms);
+    return () => { off = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
 }
 
-export default function Page(){
-  const [connected,setConnected]=useState(false); const [mode,setMode]=useState(''); const [acc,setAcc]=useState<any>(null);
-  const [symbol,setSymbol]=useState('XAUUSD'); const [symbols]=useState(['XAUUSD','EURUSD','GBPUSD','USDJPY']);
-  const [tick,setTick]=useState<any>(null); const [candles,setCandles]=useState<any[]>([]); const [analysis,setAnalysis]=useState<any>(null);
-  const [positions,setPositions]=useState<any[]>([]); const [history,setHistory]=useState<any[]>([]); const [tab,setTab]=useState<'trade'|'positions'|'history'|'log'>('trade');
-  const [wsOk,setWsOk]=useState(false);
-  const [login,setLogin]=useState(''); const [password,setPassword]=useState(''); const [server,setServer]=useState('Exness-MT5Trial9'); const [customServer,setCustomServer]=useState(false);
-  const [useMetaApi,setUseMetaApi]=useState(true); const [metaToken,setMetaToken]=useState(''); const [metaAccountId,setMetaAccountId]=useState('e9d9517c-8551-4b9e-b53d-2644152');
-  const [connecting,setConnecting]=useState(false); const [msg,setMsg]=useState<{t:'ok'|'err';m:string}|null>(null);
-  const [bot,setBot]=useState<any>(null);
-  const [riskPct,setRiskPct]=useState('3'); const [targetMult,setTargetMult]=useState('2'); const [maxDay,setMaxDay]=useState('12');
-  const [autoLot,setAutoLot]=useState(true); const [fixedLot,setFixedLot]=useState('0.01'); const [slAtr,setSlAtr]=useState('1.6'); const [tpAtr,setTpAtr]=useState('2.8');
-  const [trading,setTrading]=useState(false); const [balInput,setBalInput]=useState('10');
-  const [showConnect,setShowConnect]=useState(true);
+function Meter({ label, value, max, mark, text, hue }: { label: string; value?: number; max: number; mark?: number; text: string; hue: string }) {
+  const pct = typeof value === 'number' ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
+  return (
+    <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3">
+      <div className="flex items-baseline justify-between"><span className="label">{label}</span><span className="font-mono text-sm font-semibold">{text}</span></div>
+      <div className="relative mt-2 h-1.5 rounded-full bg-white/[0.07]">
+        <div className={`h-full rounded-full ${hue} transition-all duration-500`} style={{ width: `${pct}%` }} />
+        {mark !== undefined && <i className="absolute -top-1 h-3.5 w-px bg-white/40" style={{ left: `${(mark / max) * 100}%` }} />}
+      </div>
+    </div>
+  );
+}
 
-  const fetchAll=useCallback(async()=>{
-    try{
-      const s:any=await fetch(apiUrl('/api/status')).then(r=>r.json()).catch(()=>null);
-      if(s){ setConnected(!!s.connected); setMode(s.mode||''); if(s.account) setAcc(s.account); if(s.bot){
-        setBot(s.bot); setRiskPct(String(s.bot.config.risk_pct)); setTargetMult(String(s.bot.config.target_multiplier));
-        setMaxDay(String(s.bot.config.max_trades_per_day)); setAutoLot(!!s.bot.config.auto_lot); setFixedLot(String(s.bot.config.fixed_lot));
-        setSlAtr(String(s.bot.config.sl_atr_mult)); setTpAtr(String(s.bot.config.tp_atr_mult));
-        if(s.connected) setShowConnect(false);
-      }}
-      if(s?.connected){
-        const [t,c,an,pos,bs]=await Promise.all([
-          fetch(apiUrl(`/api/tick/${symbol}`)).then(r=>r.json()).catch(()=>null),
-          fetch(apiUrl(`/api/candles/${symbol}?timeframe=M5&count=100`)).then(r=>r.json()).catch(()=>null),
-          fetch(apiUrl(`/api/analysis/${symbol}`)).then(r=>r.json()).catch(()=>null),
-          fetch(apiUrl(`/api/positions`)).then(r=>r.json()).catch(()=>null),
-          fetch(apiUrl('/api/bot/state')).then(r=>r.json()).catch(()=>null),
-        ]);
-        if(t) setTick(t); if(c?.candles) setCandles(c.candles); if(an) setAnalysis(an); if(pos?.positions) setPositions(pos.positions); if(bs) setBot(bs);
-        const h:any=await fetch(apiUrl('/api/history?days=7')).then(r=>r.json()).catch(()=>null);
-        if(h?.history) setHistory(h.history);
-      }
-    }catch{}
-  },[symbol]);
+function Spark({ points }: { points: number[] }) {
+  if (points.length < 2) return null;
+  const min = Math.min(...points), max = Math.max(...points), r = max - min || 1;
+  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${(i / (points.length - 1)) * 300},${44 - ((p - min) / r) * 40}`).join(' ');
+  const up = points[points.length - 1] >= points[0];
+  return (
+    <svg viewBox="0 0 300 48" className="h-12 w-full" preserveAspectRatio="none">
+      <defs><linearGradient id="sg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor={up ? '#34d399' : '#f87171'} stopOpacity=".35" /><stop offset="1" stopColor={up ? '#34d399' : '#f87171'} stopOpacity="0" /></linearGradient></defs>
+      <path d={`${d} L300,48 L0,48 Z`} fill="url(#sg)" />
+      <path d={d} fill="none" stroke={up ? '#34d399' : '#f87171'} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
 
-  useEffect(()=>{ fetchAll(); const id=setInterval(fetchAll,2800); return ()=>clearInterval(id); },[fetchAll]);
-  useEffect(()=>{
-    const base=apiUrl(''); const wsBase=base?base.replace(/^http/,'ws'):(typeof window!=='undefined'?`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}`:'');
-    let ws:WebSocket|null=null;
-    try{ ws=new WebSocket(`${wsBase}/ws/telemetry`); ws.onopen=()=>setWsOk(true); ws.onclose=()=>setWsOk(false);
-      ws.onmessage=(e)=>{ try{ const d=JSON.parse(e.data); if(d.connected!==undefined) setConnected(d.connected); if(d.mode) setMode(d.mode); if(d.account) setAcc(d.account); const t=d.ticks?.[symbol]||d.ticks?.XAUUSD; if(t) setTick(t); if(d.bot) setBot(d.bot); }catch{}}
-    }catch{ setWsOk(false); }
-    return ()=>{ try{ws?.close();}catch{}}
-  },[symbol]);
+export default function Page() {
+  const [connected, setConnected] = useState(false); const [mode, setMode] = useState(''); const [acc, setAcc] = useState<any>(null);
+  const [symbol, setSymbol] = useState('XAUUSD'); const [tf, setTf] = useState<TF>('M5');
+  const [ticks, setTicks] = useState<Record<string, any>>({}); const [candles, setCandles] = useState<any[]>([]); const [candleSrc, setCandleSrc] = useState('');
+  const [analysis, setAnalysis] = useState<any>(null); const [positions, setPositions] = useState<any[]>([]); const [history, setHistory] = useState<any[]>([]);
+  const [tab, setTab] = useState<'positions' | 'history' | 'log'>('positions'); const [wsOk, setWsOk] = useState(false);
+  const [xau, setXau] = useState<XauStatus | null>(null); const [activating, setActivating] = useState(false);
+  const [bot, setBot] = useState<any>(null); const [msg, setMsg] = useState<{ t: 'ok' | 'err'; m: string } | null>(null);
 
-  const doConnect=async()=>{
+  // connect form
+  const [useMeta, setUseMeta] = useState(true); const [metaToken, setMetaToken] = useState(''); const [showTok, setShowTok] = useState(false);
+  const [metaAccountId, setMetaAccountId] = useState(''); const [login, setLogin] = useState(''); const [password, setPassword] = useState('');
+  const [server, setServer] = useState('Exness-MT5Trial9'); const [connecting, setConnecting] = useState(false); const [showConnect, setShowConnect] = useState(true);
+
+  // bot form
+  const [riskPct, setRiskPct] = useState('1'); const [targetMult, setTargetMult] = useState('2'); const [maxDay, setMaxDay] = useState('12');
+  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.6'); const [tpAtr, setTpAtr] = useState('2.8');
+  const [botTf, setBotTf] = useState<TF>('M5'); const [session, setSession] = useState(true);
+  const [manualLot, setManualLot] = useState('0.01'); const [attachSlTp, setAttachSlTp] = useState(true); const [trading, setTrading] = useState(false);
+  const hydrated = useRef(false);
+
+  const tick = ticks[symbol] || ticks.XAUUSD;
+  const toast = useCallback((t: 'ok' | 'err', m: string) => { setMsg({ t, m }); }, []);
+  useEffect(() => { if (!msg) return; const id = setTimeout(() => setMsg(null), 8000); return () => clearTimeout(id); }, [msg]);
+  useEffect(() => { try { const v = localStorage.getItem('klop_account_id'); if (v) setMetaAccountId(v); } catch {} }, []);
+
+  const hydrate = (b: any) => {
+    if (!b?.config || hydrated.current) return;
+    const c = b.config; hydrated.current = true;
+    setRiskPct(String(c.risk_pct)); setTargetMult(String(c.target_multiplier)); setMaxDay(String(c.max_trades_per_day));
+    setAutoLot(!!c.auto_lot); setFixedLot(String(c.fixed_lot)); setSlAtr(String(c.sl_atr_mult)); setTpAtr(String(c.tp_atr_mult));
+    setBotTf((c.timeframe || 'M5') as TF); setTf((c.timeframe || 'M5') as TF); setSession(!!c.session_filter);
+    if (c.symbol && SYMBOLS.includes(c.symbol)) setSymbol(c.symbol);
+  };
+
+  // ---- data: status (4s), market (5s), positions (3s), history (20s), XAU checklist (6s); ticks + account + bot arrive by WebSocket
+  usePoll(async () => {
+    const s = await get('/api/status');
+    setConnected(!!s.connected); setMode(s.mode || ''); if (s.account) setAcc(s.account);
+    if (s.bot) { setBot(s.bot); hydrate(s.bot); }
+    if (s.connected) setShowConnect(false);
+  }, 4000, []);
+  usePoll(async () => {
+    if (!connected) return;
+    const [c, a] = await Promise.all([get(`/api/candles/${symbol}?timeframe=${tf}&count=150`), get(`/api/analysis/${symbol}`).catch(() => null)]);
+    if (c?.candles) { setCandles(c.candles); setCandleSrc(c.source || ''); }
+    if (a) setAnalysis(a);
+  }, 5000, [connected, symbol, tf]);
+  usePoll(async () => { if (connected) { const p = await get('/api/positions'); if (p?.positions) setPositions(p.positions); } }, 3000, [connected]);
+  usePoll(async () => { if (connected) { const h = await get('/api/history?days=7'); if (h?.history) setHistory(h.history); } }, 20000, [connected]);
+  usePoll(async () => { if (connected && mode === 'METAAPI') setXau(await get(`/api/xau/status?timeframe=${tf}`)); }, 6000, [connected, mode, tf]);
+
+  useEffect(() => { setCandles([]); setAnalysis(null); }, [symbol, tf]);
+
+  // websocket with auto-reconnect
+  useEffect(() => {
+    let ws: WebSocket | null = null; let stop = false; let timer: any;
+    const open = () => {
+      try {
+        ws = new WebSocket(wsUrl(`/ws/telemetry?symbol=${symbol}`));
+        ws.onopen = () => setWsOk(true);
+        ws.onclose = () => { setWsOk(false); if (!stop) timer = setTimeout(open, 2500); };
+        ws.onmessage = e => {
+          try {
+            const d = JSON.parse(e.data);
+            if (d.connected !== undefined) setConnected(d.connected);
+            if (d.mode) setMode(d.mode); if (d.account) setAcc(d.account); if (d.ticks) setTicks(p => ({ ...p, ...d.ticks })); if (d.bot) setBot(d.bot);
+          } catch {}
+        };
+      } catch { setWsOk(false); }
+    };
+    open();
+    return () => { stop = true; clearTimeout(timer); try { ws?.close(); } catch {} };
+  }, [symbol]);
+
+  // ---- actions
+  const activateXau = async (quiet = false) => {
+    setActivating(true);
+    try {
+      const x = await post(`/api/xau/activate?timeframe=${tf}`);
+      setXau(x); setSymbol('XAUUSD'); setBotTf(tf); if (!quiet) toast(x.ready ? 'ok' : 'err', x.message);
+      return x;
+    } catch (e: any) { toast('err', e.message); } finally { setActivating(false); }
+  };
+
+  const doConnect = async () => {
     setConnecting(true); setMsg(null);
-    try{
-      const body:any = useMetaApi ? {use_metaapi:true, metaapi_token: metaToken.trim(), metaapi_account_id: metaAccountId.trim()} : {login,password,server};
-      const r=await fetch(apiUrl('/api/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-      const j=await r.json(); if(!r.ok) throw new Error(j.detail||j.message||`HTTP ${r.status}`);
-      setMsg({t:'ok',m:j.message}); setConnected(true); setShowConnect(false); fetchAll();
-    }catch(e:any){
-      const hint = e.message?.includes('Failed to fetch') ? ' — Railway backend unreachable. Check NEXT_PUBLIC_API_URL = https://lm1-production.up.railway.app' : '';
-      setMsg({t:'err',m:e.message+hint});
-    }
-    setConnecting(false);
+    try {
+      const body: any = useMeta ? { use_metaapi: true, metaapi_token: metaToken.trim(), metaapi_account_id: metaAccountId.trim() } : { login, password, server };
+      const j = await post('/api/connect', body);
+      setConnected(true); setShowConnect(false); hydrated.current = false;
+      if (useMeta) {
+        try { localStorage.setItem('klop_account_id', metaAccountId.trim()); } catch {}
+        setMetaToken('');
+        const x = await activateXau(true);
+        toast(x?.ready ? 'ok' : 'err', `${j.message} — ${x?.message || 'XAUUSD check failed'}`);
+      } else toast('ok', j.message);
+    } catch (e: any) {
+      toast('err', e.message + (e.message?.includes('Failed to fetch') ? ' — backend unreachable. Check NEXT_PUBLIC_API_URL.' : ''));
+    } finally { setConnecting(false); }
   };
-  const doTrade=async(a:'BUY'|'SELL')=>{
-    setTrading(true);
-    try{
-      const vol=autoLot?undefined:parseFloat(fixedLot);
-      const body:any={symbol,action:a,volume:vol??0.01};
-      const r=await fetch(apiUrl('/api/trade'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-      const j=await r.json(); if(!r.ok) throw new Error(j.detail||j.message); setMsg({t:'ok',m:j.message}); fetchAll();
-    }catch(e:any){ setMsg({t:'err',m:e.message}); }
-    setTrading(false);
-  };
-  const saveBotConfig=async()=>{
-    try{
-      const r=await fetch(apiUrl('/api/bot/config'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({risk_pct:parseFloat(riskPct),target_multiplier:parseFloat(targetMult),max_trades_per_day:parseInt(maxDay),auto_lot:autoLot,fixed_lot:parseFloat(fixedLot),sl_atr_mult:parseFloat(slAtr),tp_atr_mult:parseFloat(tpAtr),symbol})});
-      const j=await r.json(); if(!r.ok) throw new Error(j.detail); setBot(j); setMsg({t:'ok',m:'✓ Bot config saved'});
-    }catch(e:any){ setMsg({t:'err',m:e.message}); }
-  };
-  const startBot=async()=>{
-    try{
-      const r=await fetch(apiUrl('/api/bot/start'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({risk_pct:parseFloat(riskPct),target_multiplier:parseFloat(targetMult),max_trades_per_day:parseInt(maxDay),auto_lot:autoLot,fixed_lot:parseFloat(fixedLot),sl_atr_mult:parseFloat(slAtr),tp_atr_mult:parseFloat(tpAtr),symbol})});
-      const j=await r.json(); if(!r.ok) throw new Error(j.detail||j.message); setBot(j); setMsg({t:'ok',m:'🚀 Auto Flip STARTED — watch Log & chart markers'});
-    }catch(e:any){ setMsg({t:'err',m:e.message}); }
-  };
-  const stopBot=async()=>{
-    try{ const r=await fetch(apiUrl('/api/bot/stop'),{method:'POST'}); const j=await r.json(); setBot(j); setMsg({t:'ok',m:'⏹ Bot stopped'});}catch(e:any){ setMsg({t:'err',m:e.message}); }
-  };
-  const closePos=async(ticket:number)=>{
-    try{ const r=await fetch(apiUrl(`/api/close/${ticket}`),{method:'POST'}); const j=await r.json(); if(!r.ok) throw new Error(j.detail||j.message); setMsg({t:'ok',m:j.message}); fetchAll(); }catch(e:any){ setMsg({t:'err',m:e.message}); }
-  };
-  const sc=(s?:string)=> s==='BUY'?'emerald':s==='SELL'?'red':s?.includes('OVER')?'amber':'neutral';
-  const flipPct=bot?.stats?.flip_progress??0; const equityCurve=bot?.stats?.equity_curve||[]; const markers=bot?.stats?.markers||[];
 
-  const modeTone = mode==='NATIVE'?'emerald':mode==='BRIDGE'?'emerald':mode==='METAAPI'?'emerald':mode==='EXNESS_API'?'amber':mode==='REAL'?'red':'neutral';
-  const modeLabel = mode==='NATIVE'?'NATIVE (mt5linux/Wine)':mode==='BRIDGE'?'BRIDGE (Windows)':mode==='METAAPI'?'METAAPI NATIVE (REAL broker)':mode==='EXNESS_API'?'EXNESS_API':mode==='REAL'?'PAPER on LIVE (CF blocked)':'—';
+  const num = (v: string) => parseFloat(v);
+  const botBody = () => ({ risk_pct: num(riskPct), target_multiplier: num(targetMult), max_trades_per_day: parseInt(maxDay), auto_lot: autoLot, fixed_lot: num(fixedLot), sl_atr_mult: num(slAtr), tp_atr_mult: num(tpAtr), symbol, timeframe: botTf, session_filter: session });
+  const validate = () => {
+    if (!(num(riskPct) > 0 && num(riskPct) <= 5)) return 'Risk per trade must be between 0.1% and 5%';
+    if (!(num(slAtr) > 0 && num(tpAtr) > 0)) return 'SL / TP multipliers must be above 0';
+    if (!autoLot && !(num(fixedLot) >= 0.01)) return 'Fixed lot must be at least 0.01';
+    return null;
+  };
+  const saveBot = async () => { const v = validate(); if (v) return toast('err', v); try { setBot(await post('/api/bot/config', botBody())); toast('ok', '✓ Bot settings saved'); } catch (e: any) { toast('err', e.message); } };
+  const startBot = async () => {
+    const v = validate(); if (v) return toast('err', v);
+    if (symbol === 'XAUUSD' && mode === 'METAAPI' && xau && !xau.ready) return toast('err', 'XAUUSD is not ready — fix the red checks above (or press Activate XAUUSD).');
+    try { setBot(await post('/api/bot/start', botBody())); toast('ok', '🚀 Auto Flip started — watch the Log tab'); setTab('log'); } catch (e: any) { toast('err', e.message); }
+  };
+  const stopBot = async () => { try { setBot(await post('/api/bot/stop')); toast('ok', '⏹ Bot stopped'); } catch (e: any) { toast('err', e.message); } };
+  const doTrade = async (a: 'BUY' | 'SELL') => {
+    const lot = num(manualLot); if (!(lot >= 0.01)) return toast('err', 'Lot must be at least 0.01');
+    const atr = analysis?.atr; const t = tick; let sl: number | undefined, tp: number | undefined;
+    if (attachSlTp && atr > 0 && t?.bid) { const e = a === 'BUY' ? t.ask : t.bid; const d = atr * num(slAtr), r = atr * num(tpAtr); sl = +(a === 'BUY' ? e - d : e + d).toFixed(2); tp = +(a === 'BUY' ? e + r : e - r).toFixed(2); }
+    if (!window.confirm(`${a} ${lot} ${symbol}${sl ? `\nSL ${sl}  •  TP ${tp}` : '\nNo SL/TP attached'}\n${mode === 'METAAPI' ? 'This sends a REAL order to your broker.' : ''}`)) return;
+    setTrading(true);
+    try { const j = await post('/api/trade', { symbol, action: a, volume: lot, sl, tp }); toast(j.status === 'error' ? 'err' : 'ok', j.message); } catch (e: any) { toast('err', e.message); } finally { setTrading(false); }
+  };
+  const closePos = async (t: any) => { try { const j = await post(`/api/close/${t}`); toast(j.status === 'error' ? 'err' : 'ok', j.message); } catch (e: any) { toast('err', e.message); } };
+  const disconnect = async () => { try { await post('/api/disconnect'); } catch {} setConnected(false); setAcc(null); setXau(null); setShowConnect(true); };
+
+  const st = bot?.stats; const sig = st?.last_signal || analysis?.signal || 'HOLD';
+  const sigCls = sig === 'BUY' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300' : sig === 'SELL' ? 'border-rose-400/30 bg-rose-400/10 text-rose-300' : sig.includes('WARN') ? 'border-amber-400/30 bg-amber-400/10 text-amber-300' : 'border-white/10 bg-white/5 text-zinc-400';
+  const eq: number[] = (st?.equity_curve || []).map((p: any) => p.equity);
+  const flip = st?.flip_progress ?? 0;
+  const modeLabel = mode === 'METAAPI' ? 'MetaApi • Real broker' : mode === 'BRIDGE' ? 'Bridge' : mode === 'NATIVE' ? 'MT5 native' : mode === 'REAL' ? 'Paper on live price' : mode;
+  const risky = num(riskPct) > 2;
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-zinc-100 selection:bg-amber-500/30">
-      {/* Glow */}
-      <div className="fixed inset-0 pointer-events-none -z-10 bg-[radial-gradient(600px_400px_at_20%_0%,rgba(120,90,255,0.12),transparent_60%),radial-gradient(800px_500px_at_100%_10%,rgba(245,158,11,0.10),transparent_60%)]" />
-      {/* Header — Revolut-inspired premium */}
-      <header className="sticky top-0 z-30 backdrop-blur-2xl bg-[#0a0a0f]/80 border-b border-zinc-800/80">
-        <div className="max-w-[1520px] mx-auto px-4 sm:px-6 h-[64px] flex items-center justify-between gap-4">
+    <div className="min-h-screen selection:bg-amber-400/30">
+      <div className="pointer-events-none fixed inset-0 -z-10 bg-[radial-gradient(700px_420px_at_12%_-5%,rgba(245,185,66,0.10),transparent_60%),radial-gradient(700px_500px_at_100%_0%,rgba(120,90,255,0.10),transparent_60%)]" />
+
+      <header className="sticky top-0 z-30 border-b border-white/[0.06] bg-[#07070b]/75 backdrop-blur-2xl">
+        <div className="mx-auto flex h-16 max-w-[1500px] items-center justify-between gap-3 px-4 sm:px-6">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-violet-600 via-indigo-600 to-amber-500 flex items-center justify-center font-black text-white shadow-lg shadow-violet-600/20">◈</div>
-            <div>
-              <h1 className="font-semibold tracking-[-0.02em] text-[17px] leading-none">Klop Apex <span className="ml-1 text-[10px] tracking-[0.18em] uppercase font-bold px-1.5 py-0.5 rounded bg-amber-500 text-zinc-950">Flip Engine</span></h1>
-              <p className="text-[11px] tracking-[0.14em] uppercase text-zinc-500 font-medium">Exness MT5 • Auto Scalper • Railway</p>
+            <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-amber-300 to-amber-600 text-lg font-black text-zinc-950 shadow-lg shadow-amber-500/25">Au</div>
+            <div className="leading-tight">
+              <h1 className="text-[17px] font-semibold tracking-tight">Klop <span className="gold-text">Apex</span></h1>
+              <p className="label !text-[10px]">XAUUSD • Auto scalper</p>
             </div>
-            <div className="hidden lg:flex items-center gap-2 ml-4">
-              <Pill tone={connected?'emerald':'neutral'}><span className={`w-1.5 h-1.5 rounded-full ${connected?'bg-emerald-400 animate-pulse':'bg-zinc-500'}`}/>{connected?'Connected':'Disconnected'}</Pill>
-              {connected && <Pill tone={modeTone}>{modeLabel}</Pill>}
-              {bot?.enabled && <span className="text-xs px-2.5 py-1 rounded-full bg-amber-500 text-zinc-950 font-black">AUTO ●</span>}
+            <div className="ml-3 hidden items-center gap-2 md:flex">
+              <span className={`chip ${connected ? 'border-emerald-400/25 bg-emerald-400/10 text-emerald-300' : 'border-white/10 bg-white/5 text-zinc-400'}`}>
+                <i className={`h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-zinc-500'}`} />{connected ? 'Connected' : 'Disconnected'}
+              </span>
+              {connected && <span className="chip border-white/10 bg-white/5 text-zinc-300">{modeLabel}</span>}
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {tick && <div className="hidden md:flex items-center gap-2.5 text-xs font-mono bg-zinc-900/80 border border-zinc-800 rounded-full pl-3 pr-2 py-1.5 backdrop-blur">
-              <span className="text-zinc-500">{symbol}</span><span className="text-white font-bold">{typeof tick.bid==='number'?tick.bid.toFixed(2):tick.bid}</span>
-              <span className="w-px h-3 bg-zinc-800"/>{/* spread */}
-              <span className="text-zinc-400">spr {tick.spread??'-'}</span>
-              <span className={`w-2 h-2 rounded-full ${wsOk?'bg-emerald-400':'bg-amber-400'}`} title={wsOk?'WS live':'polling'}/>
-            </div>}
-            <select value={symbol} onChange={e=>setSymbol(e.target.value)} className="bg-zinc-900 border border-zinc-800 rounded-full px-3 py-1.5 text-sm focus:outline-none focus:border-violet-500/50">
-              {symbols.map(s=><option key={s} value={s}>{s}</option>)}
-            </select>
-            {connected && <button onClick={async()=>{ await fetch(apiUrl('/api/disconnect'),{method:'POST'}); setConnected(false); setAcc(null); setShowConnect(true); }} className="hidden sm:inline text-xs px-3 py-1.5 rounded-full border border-zinc-800 hover:bg-zinc-900">Disconnect</button>}
-            {!connected && <button onClick={()=>setShowConnect(v=>!v)} className="text-xs px-4 py-1.5 rounded-full bg-violet-600 hover:bg-violet-500 text-white font-semibold">Connect</button>}
+            <div className="seg hidden sm:inline-flex">{SYMBOLS.map(s => <button key={s} data-on={symbol === s} onClick={() => setSymbol(s)}>{s}</button>)}</div>
+            <select value={symbol} onChange={e => setSymbol(e.target.value)} className="input !w-auto !rounded-full !py-1.5 sm:hidden">{SYMBOLS.map(s => <option key={s}>{s}</option>)}</select>
+            {connected ? <button onClick={disconnect} className="btn-ghost !px-4 !py-1.5 text-xs">Disconnect</button> : <button onClick={() => setShowConnect(v => !v)} className="btn-gold !px-4 !py-1.5 text-xs">Connect</button>}
           </div>
         </div>
       </header>
 
-      <main className="max-w-[1520px] mx-auto px-4 sm:px-6 py-6 space-y-5">
-        {msg && <div className={`rounded-2xl border px-4 py-3 text-sm backdrop-blur ${msg.t==='ok'?'border-emerald-500/20 bg-emerald-500/10 text-emerald-200':'border-red-500/20 bg-red-500/10 text-red-200'}`}>{msg.m}</div>}
+      <main className="mx-auto max-w-[1500px] space-y-5 px-4 py-6 sm:px-6">
+        {msg && (
+          <div onClick={() => setMsg(null)} className={`rise cursor-pointer rounded-2xl border px-4 py-3 text-sm ${msg.t === 'ok' ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-200' : 'border-rose-400/25 bg-rose-400/10 text-rose-200'}`}>{msg.m}</div>
+        )}
 
         {(showConnect || !connected) && (
-          <div className="rounded-[20px] border border-zinc-800 bg-gradient-to-br from-zinc-900/80 to-zinc-950/80 backdrop-blur p-6 shadow-2xl shadow-black/30">
-            <div className="flex flex-wrap items-start justify-between gap-3">
+          <section className="card-pad rise">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="font-semibold tracking-[-0.02em] text-lg">Connect Exness MT5</h2>
-                <p className="text-sm text-zinc-500 mt-1">Numeric login or PA email. Railway Wine = NATIVE broker, otherwise live XAU price + REAL signals. No MetaApi, free.</p>
+                <h2 className="text-lg font-semibold tracking-tight">Connect your Exness account</h2>
+                <p className="mt-1 text-sm text-zinc-500">MetaApi trades your real MT5 account from the cloud. After connecting, XAUUSD is activated automatically.</p>
               </div>
-              <Pill tone="amber">Live XAU {tick ? `$${Number(tick.bid).toFixed(2)}` : '~$4131'}</Pill>
+              <div className="seg"><button data-on={useMeta} onClick={() => setUseMeta(true)}>MetaApi</button><button data-on={!useMeta} onClick={() => setUseMeta(false)}>MT5 direct</button></div>
             </div>
-            <div className="flex items-center gap-2 mb-3">
-              <button onClick={()=>setUseMetaApi(true)} className={`px-4 py-1.5 rounded-full text-xs font-bold ${useMetaApi?'bg-emerald-500 text-white shadow':'bg-zinc-800 text-zinc-400 border border-zinc-700'}`}>● MetaApi (REAL broker)</button>
-              <button onClick={()=>setUseMetaApi(false)} className={`px-4 py-1.5 rounded-full text-xs font-bold ${!useMetaApi?'bg-violet-600 text-white shadow':'bg-zinc-800 text-zinc-400 border border-zinc-700'}`}>MT5 Direct (BRIDGE/Wine)</button>
-              <span className={`text-[11px] px-2 py-0.5 rounded-full border ${useMetaApi?'bg-emerald-500/10 text-emerald-400 border-emerald-500/20':'bg-zinc-800 text-zinc-500 border-zinc-700'}`}>{useMetaApi?'Switch any day — paste new AccountID':'Needs BRIDGE_URL/Wine'}</span>
-            </div>
-            {useMetaApi ? (
-              <div className="grid sm:grid-cols-[1.2fr_1fr_auto] gap-3">
-                <input value={metaToken} onChange={e=>setMetaToken(e.target.value)} placeholder="MetaApi Token ey... (from app.metaapi.cloud/token)" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 placeholder:text-zinc-600"/>
-                <input value={metaAccountId} onChange={e=>setMetaAccountId(e.target.value)} placeholder="Account ID e9d9517c-..." className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm font-mono focus:outline-none focus:border-emerald-500/50 placeholder:text-zinc-600"/>
-                <button onClick={doConnect} disabled={connecting||!metaToken||!metaAccountId} className="rounded-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-950 font-black px-6 py-2.5 text-sm shadow-lg">{connecting?'Connecting…':'Connect MetaApi →'}</button>
+            {useMeta ? (
+              <div className="mt-4 grid gap-3 lg:grid-cols-[1.3fr_1fr_auto]">
+                <div className="relative">
+                  <input value={metaToken} onChange={e => setMetaToken(e.target.value)} type={showTok ? 'text' : 'password'} autoComplete="off" placeholder="MetaApi token (eyJ…)" className="input pr-14" />
+                  <button type="button" onClick={() => setShowTok(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-semibold text-zinc-500 hover:text-zinc-300">{showTok ? 'HIDE' : 'SHOW'}</button>
+                </div>
+                <input value={metaAccountId} onChange={e => setMetaAccountId(e.target.value)} placeholder="Account ID (xxxxxxxx-xxxx-…)" className="input font-mono" />
+                <button onClick={doConnect} disabled={connecting || !metaToken.trim() || !metaAccountId.trim()} className="btn-gold">{connecting ? 'Connecting…' : 'Connect & activate XAUUSD →'}</button>
               </div>
             ) : (
-              <div className="grid sm:grid-cols-[1fr_1fr_1fr_auto] gap-3">
-                <input value={login} onChange={e=>setLogin(e.target.value)} placeholder="MT5 Login (e.g. 477338841)" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50 placeholder:text-zinc-600"/>
-                <input value={password} onChange={e=>setPassword(e.target.value)} type="password" placeholder="Master password" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50"/>
-                {!customServer ? <select value={server} onChange={e=>setServer(e.target.value)} className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-violet-500/50">{SERVERS.map(s=><option key={s} value={s}>{s}</option>)}</select> : <input value={server} onChange={e=>setServer(e.target.value)} placeholder="Exness-MT5Real" className="bg-zinc-950 border border-zinc-800 rounded-2xl px-4 py-2.5 text-sm"/>}
-                <button onClick={doConnect} disabled={connecting||!login||!password} className="rounded-full bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white font-semibold px-6 py-2.5 text-sm shadow-lg">{connecting?'Connecting…':'Connect →'}</button>
+              <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_1fr_1fr_auto]">
+                <input value={login} onChange={e => setLogin(e.target.value)} placeholder="MT5 login" className="input" />
+                <input value={password} onChange={e => setPassword(e.target.value)} type="password" placeholder="Master password" className="input" />
+                <select value={server} onChange={e => setServer(e.target.value)} className="input">{SERVERS.map(s => <option key={s}>{s}</option>)}</select>
+                <button onClick={doConnect} disabled={connecting || !login || !password} className="btn-gold">{connecting ? 'Connecting…' : 'Connect →'}</button>
               </div>
             )}
-            {!useMetaApi && <label className="flex items-center gap-2 mt-3 text-xs text-zinc-500 cursor-pointer"><input type="checkbox" checked={customServer} onChange={e=>setCustomServer(e.target.checked)} className="rounded"/> Custom server (e.g. Exness-MT5Trial9)</label>}
-            {useMetaApi ? <p className="text-xs text-emerald-400 mt-2">✅ MetaApi = <b>NATIVE REAL</b> on Railway — no Wine needed. Get Token at <span className="underline">app.metaapi.cloud/token</span>, paste AccountID from Deployed card. Switch account any day by pasting new ID here.</p> : (!connected && tick ? <p className="text-xs text-zinc-600 mt-2">Chart is LIVE (gold-api). MT5 Direct needs BRIDGE_URL/Wine for NATIVE.</p> : null)}
-          </div>
+            {useMeta && <p className="mt-3 text-xs text-zinc-500">Account must show <b className="text-zinc-300">DEPLOYED</b> and <b className="text-zinc-300">CONNECTED</b> in app.metaapi.cloud. The token is sent to your backend only and is not stored in the browser.</p>}
+          </section>
         )}
 
-        {/* KPI — Revolut cards: pill, high contrast, no shadows */}
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+        <XauHero tick={ticks.XAUUSD} status={xau} connected={connected} wsOk={wsOk} botOn={!!bot?.enabled} activating={activating} onActivate={() => activateXau()} selected={symbol === 'XAUUSD'} />
+
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
           {[
-            {k:'Balance', v: acc?`$${Number(acc.balance).toLocaleString(undefined,{minimumFractionDigits:2})}`:'—', sub: acc?.login?`${acc.login} @ ${acc.server}`:'Not connected', tone: acc?'text-white':''},
-            {k:'Equity', v: acc?`$${Number(acc.equity).toLocaleString(undefined,{minimumFractionDigits:2})}`:'—', tone:(acc?.equity??0)>=(acc?.balance??0)?'text-emerald-400':'text-red-400'},
-            {k:'Floating P/L', v: acc?`$${Number(acc.profit).toFixed(2)}`:'—', tone:(acc?.profit??0)>=0?'text-emerald-400':'text-red-400'},
-            {k:'Today P/L', v: bot?`$${Number(bot.stats.pnl_today).toFixed(2)}`:'—', sub: bot?`${bot.stats.wins}W / ${bot.stats.losses}L • ${bot.stats.win_rate}%`:'', tone:(bot?.stats.pnl_today??0)>=0?'text-emerald-400':'text-red-400'},
-          ].map((c,i)=>
-            <div key={i} className="rounded-[20px] border border-zinc-800 bg-zinc-900/70 backdrop-blur p-5">
-              <p className="text-[11px] tracking-[0.16em] uppercase font-semibold text-zinc-500">{c.k}</p>
-              <p className={`text-[22px] font-semibold tracking-[-0.02em] mt-1 font-mono ${c.tone||'text-zinc-500'}`}>{c.v}</p>
-              {c.sub && <p className="text-xs text-zinc-500 mt-1 truncate">{c.sub}</p>}
+            { k: 'Balance', v: acc ? `$${money(acc.balance)}` : '—', sub: acc?.login ? `${acc.login} • ${acc.server}` : 'Not connected' },
+            { k: 'Equity', v: acc ? `$${money(acc.equity)}` : '—', c: acc ? tone(acc.equity - acc.balance) : '' },
+            { k: 'Floating P/L', v: acc ? signed(acc.profit) : '—', c: acc ? tone(acc.profit) : '' },
+            { k: 'Today P/L', v: st ? signed(st.pnl_today) : '—', sub: st ? `${st.wins}W / ${st.losses}L • ${st.win_rate}%` : '', c: st ? tone(st.pnl_today) : '' },
+          ].map((c, i) => (
+            <div key={i} className="card-pad rise" style={{ animationDelay: `${i * 40}ms` }}>
+              <p className="label">{c.k}</p>
+              <p className={`mt-1.5 font-mono text-[22px] font-semibold tracking-tight ${c.c || 'text-white'}`}>{c.v}</p>
+              {c.sub && <p className="mt-1 truncate text-xs text-zinc-500">{c.sub}</p>}
             </div>
-          )}
-          <div className="rounded-[20px] border border-zinc-800 bg-zinc-900/70 backdrop-blur p-5 col-span-2 lg:col-span-1">
-            <p className="text-[11px] tracking-[0.16em] uppercase font-semibold text-zinc-500">Flip Progress</p>
-            <p className="text-[22px] font-semibold mt-1 font-mono">{flipPct.toFixed(1)}%</p>
-            <div className="w-full h-2 bg-zinc-800 rounded-full mt-2 overflow-hidden"><div className="h-full bg-gradient-to-r from-violet-600 to-amber-500 transition-all duration-500" style={{width:`${Math.min(100,flipPct)}%`}}/></div>
-            <p className="text-[11px] text-zinc-500 mt-1 truncate">{bot?`$${bot.stats.current_balance} → $${bot.stats.target_balance} (×${bot?.config.target_multiplier})`:'—'}</p>
+          ))}
+          <div className="card-pad col-span-2 lg:col-span-1">
+            <p className="label">Flip progress</p>
+            <p className="mt-1.5 font-mono text-[22px] font-semibold tracking-tight">{flip.toFixed(1)}%</p>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.07]"><div className="h-full rounded-full bg-gradient-to-r from-amber-300 to-amber-500 transition-all duration-700" style={{ width: `${Math.min(100, flip)}%` }} /></div>
+            <p className="mt-1.5 truncate text-[11px] text-zinc-500">{st ? `$${money(st.current_balance)} → $${money(st.target_balance)}` : '—'}</p>
           </div>
         </div>
 
-        {connected && mode==='REAL' && (
-          <div className="rounded-2xl border border-red-500/30 bg-red-500/10 backdrop-blur p-4 flex flex-wrap items-center gap-3">
-            <span className="text-sm font-black text-red-300 animate-pulse">⚠️ REAL BALANCE NOT SYNCED — Enter your Exness balance:</span>
-            <input value={balInput} onChange={e=>setBalInput(e.target.value)} placeholder="e.g. 10" className="w-28 bg-zinc-950 border border-red-900 rounded-full px-3 py-2 text-sm font-mono text-white placeholder:text-zinc-500 focus:border-red-500"/>
-            <button onClick={async()=>{ try{ const r=await fetch(apiUrl('/api/balance/set'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({balance:parseFloat(balInput)})}); const j=await r.json(); if(!r.ok) throw new Error(j.detail); setMsg({t:'ok',m:j.message}); fetchAll(); }catch(e:any){ setMsg({t:'err',m:e.message}); } }} className="px-5 py-2 rounded-full bg-red-500 hover:bg-red-400 text-white font-black text-sm shadow-lg">Sync Balance →</button>
-            <span className="text-xs text-zinc-400">Chart = LIVE $4141 ✅ | Exness PA is <b>Cloudflare blocked</b> on Railway — auto balance needs <b>BRIDGE_URL</b> (Windows) or <b>Wine</b>. Until then trades are PAPER on live price.</span>
-          </div>
-        )}
-
-        <div className="grid lg:grid-cols-[1fr_380px] gap-5">
-          {/* Chart */}
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs tracking-[0.14em] uppercase font-bold text-zinc-500">{symbol} • M5 • {bot?.stats.last_signal||'HOLD'} {analysis?.rsi?`RSI ${analysis.rsi}`:''}</h3>
-              <Pill tone={sc(bot?.stats.last_signal||analysis?.signal)}>{bot?.stats.last_signal||analysis?.signal||'HOLD'}</Pill>
-            </div>
-            <div className="rounded-[20px] border border-zinc-800 overflow-hidden bg-zinc-900/50 backdrop-blur">
-              <TradingChart data={candles} markers={markers}/>
-            </div>
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 backdrop-blur p-4 text-sm">
-              <p className="text-zinc-300 leading-relaxed">{bot?.stats.last_reason || analysis?.reason || 'Awaiting EMA×RSI + ADX signal…'}</p>
-              <p className="text-xs text-zinc-500 mt-2 font-mono flex flex-wrap gap-x-3"><span>EMA9 {analysis?.ema9}</span><span>EMA21 {analysis?.ema21}</span><span>ADX {analysis?.adx}</span><span>ATR {analysis?.atr}</span><span>{analysis?.price && `$${analysis.price}`}</span></p>
-            </div>
-            {equityCurve.length>1 && (
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 backdrop-blur p-4">
-                <p className="text-xs tracking-[0.14em] uppercase font-semibold text-zinc-500 mb-2">Equity Curve</p>
-                <div className="flex items-end gap-[2px] h-14">
-                  {equityCurve.slice(-40).map((p:any,i:number)=>{
-                    const min=Math.min(...equityCurve.map((x:any)=>x.equity)); const max=Math.max(...equityCurve.map((x:any)=>x.equity)); const rng=max-min||1;
-                    const h=((p.equity-min)/rng)*100;
-                    return <div key={i} className="flex-1 bg-violet-500/80 rounded-sm" style={{height:`${Math.max(4,h)}%`}} title={`${p.equity}`} />;
-                  })}
+        <div className="grid gap-5 xl:grid-cols-[1fr_400px]">
+          <div className="min-w-0 space-y-5">
+            <section className="card overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-5 py-3.5">
+                <div className="flex items-center gap-3">
+                  <h3 className="font-semibold tracking-tight">{symbol}</h3>
+                  <div className="seg">{TFS.map(t => <button key={t} data-on={tf === t} onClick={() => setTf(t)}>{t}</button>)}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {candleSrc && <span className={`chip ${candleSrc === 'BROKER' ? 'border-emerald-400/25 bg-emerald-400/10 text-emerald-300' : 'border-amber-400/25 bg-amber-400/10 text-amber-300'}`} title={candleSrc === 'BROKER' ? 'Candles come from your broker' : 'Fallback public data (PAXG) — not your broker'}>{candleSrc === 'BROKER' ? 'Broker candles' : `Fallback: ${candleSrc}`}</span>}
+                  <span className={`chip font-bold ${sigCls}`}>{sig.replace('_WARN', '')}{analysis?.confidence ? ` • ${analysis.confidence}%` : ''}</span>
                 </div>
               </div>
-            )}
-            <div className="grid grid-cols-4 gap-2 text-center">
-              {[{v:`${bot?.stats.trades_today??0}/${bot?.config.max_trades_per_day??12}`,k:'Trades'},{v:String(bot?.stats.wins??0),k:'Wins',c:'text-emerald-400'},{v:String(bot?.stats.losses??0),k:'Losses',c:'text-red-400'},{v:`${bot?.stats.win_rate??0}%`,k:'Win Rate'}].map((s,i)=>
-                <div key={i} className="rounded-2xl border border-zinc-800 bg-zinc-900/70 backdrop-blur py-3.5"><p className={`text-lg font-mono font-bold ${s.c||''}`}>{s.v}</p><p className="text-[11px] tracking-[0.12em] uppercase font-semibold text-zinc-500">{s.k}</p></div>
-              )}
-            </div>
+              <div className="px-2 pb-2 pt-3"><TradingChart data={candles} markers={st?.markers} resetKey={`${symbol}-${tf}`} height={420} /></div>
+            </section>
+
+            <section className="card-pad">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <Meter label="RSI 14" value={analysis?.rsi} max={100} mark={50} text={analysis?.rsi != null ? String(analysis.rsi) : '—'} hue={analysis?.rsi > 70 ? 'bg-rose-400' : analysis?.rsi < 30 ? 'bg-emerald-400' : 'bg-violet-400'} />
+                <Meter label="ADX 14" value={analysis?.adx} max={50} mark={18} text={analysis?.adx != null ? String(analysis.adx) : '—'} hue={analysis?.adx >= 18 ? 'bg-amber-400' : 'bg-zinc-600'} />
+                <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3"><div className="flex items-baseline justify-between"><span className="label">ATR 14</span><span className="font-mono text-sm font-semibold">{analysis?.atr ?? '—'}</span></div><p className="mt-2 font-mono text-[11px] text-zinc-500">SL ≈ ${analysis?.atr ? (analysis.atr * num(slAtr)).toFixed(2) : '—'} • TP ≈ ${analysis?.atr ? (analysis.atr * num(tpAtr)).toFixed(2) : '—'}</p></div>
+                <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3"><div className="flex items-baseline justify-between"><span className="label">EMA 9 / 21</span><span className={`font-mono text-sm font-semibold ${analysis?.ema9 > analysis?.ema21 ? 'text-emerald-400' : 'text-rose-400'}`}>{analysis?.ema9 > analysis?.ema21 ? '▲ bull' : analysis?.ema9 < analysis?.ema21 ? '▼ bear' : '—'}</span></div><p className="mt-2 font-mono text-[11px] text-zinc-500">{analysis?.ema9 ?? '—'} / {analysis?.ema21 ?? '—'}</p></div>
+              </div>
+              <p className="mt-4 text-sm leading-relaxed text-zinc-300">{st?.last_reason || analysis?.reason || 'Waiting for a signal…'}</p>
+              {analysis?.session && <p className="mt-1 text-xs text-zinc-500">{analysis.session}</p>}
+            </section>
+
+            <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {[{ v: `${st?.trades_today ?? 0}/${bot?.config?.max_trades_per_day ?? 12}`, k: 'Trades today' }, { v: String(st?.wins ?? 0), k: 'Wins', c: 'text-emerald-400' }, { v: String(st?.losses ?? 0), k: 'Losses', c: 'text-rose-400' }, { v: `${st?.win_rate ?? 0}%`, k: 'Win rate' }].map((s, i) => (
+                <div key={i} className="card py-4 text-center"><p className={`font-mono text-xl font-semibold ${s.c || ''}`}>{s.v}</p><p className="label mt-0.5">{s.k}</p></div>
+              ))}
+            </section>
+
+            {eq.length > 1 && <section className="card-pad"><p className="label mb-2">Equity</p><Spark points={eq} /></section>}
           </div>
 
-          {/* Controls */}
-          <div className="space-y-4">
-            <div className="rounded-[20px] border border-violet-500/20 bg-gradient-to-br from-violet-600/10 via-indigo-600/10 to-amber-500/10 backdrop-blur p-5">
-              <h3 className="font-bold text-sm flex items-center gap-2">⚡ Auto Flip Engine {bot?.enabled && <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500 text-white animate-pulse">RUNNING</span>}</h3>
-              <div className="grid grid-cols-2 gap-3 mt-4">
-                <label className="text-xs font-medium text-zinc-400">Risk / trade %<input value={riskPct} onChange={e=>setRiskPct(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm font-mono focus:outline-none focus:border-violet-500/50"/></label>
-                <label className="text-xs font-medium text-zinc-400">Flip Target (×)<select value={targetMult} onChange={e=>setTargetMult(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm"><option value="1.5">×1.5</option><option value="2">×2</option><option value="3">×3</option><option value="5">×5</option><option value="10">×10</option></select></label>
-                <label className="text-xs font-medium text-zinc-400">Max / day<input value={maxDay} onChange={e=>setMaxDay(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm font-mono"/></label>
-                <label className="text-xs font-medium text-zinc-400">SL (ATR ×)<input value={slAtr} onChange={e=>setSlAtr(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm font-mono"/></label>
-                <label className="text-xs font-medium text-zinc-400">TP (ATR ×)<input value={tpAtr} onChange={e=>setTpAtr(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm font-mono"/></label>
-                <label className="text-xs font-medium text-zinc-400">Lot mode<select value={autoLot?'auto':'fixed'} onChange={e=>setAutoLot(e.target.value==='auto')} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm"><option value="auto">Auto (risk %)</option><option value="fixed">Fixed</option></select></label>
-                {!autoLot && <label className="text-xs font-medium text-zinc-400">Fixed lot<input value={fixedLot} onChange={e=>setFixedLot(e.target.value)} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-full px-3 py-2 text-sm font-mono"/></label>}
+          <aside className="space-y-5">
+            <section className="card-pad border-amber-400/15 bg-gradient-to-b from-amber-400/[0.06] to-transparent">
+              <div className="flex items-center justify-between"><h3 className="font-semibold tracking-tight">⚡ Auto Flip Engine</h3>{bot?.enabled && <span className="chip border-emerald-400/30 bg-emerald-400/10 text-emerald-300"><i className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />RUNNING</span>}</div>
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <label className="label">Risk / trade %<input value={riskPct} onChange={e => setRiskPct(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                <label className="label">Flip target<select value={targetMult} onChange={e => setTargetMult(e.target.value)} className="input mt-1.5 !normal-case !tracking-normal">{['1.5', '2', '3', '5', '10'].map(x => <option key={x} value={x}>×{x}</option>)}</select></label>
+                <label className="label">SL (ATR ×)<input value={slAtr} onChange={e => setSlAtr(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                <label className="label">TP (ATR ×)<input value={tpAtr} onChange={e => setTpAtr(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                <label className="label">Max / day<input value={maxDay} onChange={e => setMaxDay(e.target.value)} inputMode="numeric" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                <label className="label">Bot timeframe<select value={botTf} onChange={e => setBotTf(e.target.value as TF)} className="input mt-1.5 !normal-case !tracking-normal">{TFS.map(t => <option key={t}>{t}</option>)}</select></label>
+                <label className="label">Lot mode<select value={autoLot ? 'auto' : 'fixed'} onChange={e => setAutoLot(e.target.value === 'auto')} className="input mt-1.5 !normal-case !tracking-normal"><option value="auto">Auto (risk %)</option><option value="fixed">Fixed</option></select></label>
+                {!autoLot ? <label className="label">Fixed lot<input value={fixedLot} onChange={e => setFixedLot(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                  : <label className="label flex items-end gap-2 pb-2.5 !normal-case !tracking-normal"><input type="checkbox" checked={session} onChange={e => setSession(e.target.checked)} className="h-4 w-4 accent-amber-400" /><span className="text-xs text-zinc-400">London + NY only</span></label>}
               </div>
-              <div className="flex gap-2 mt-4">
-                <button onClick={saveBotConfig} className="flex-1 py-2.5 rounded-full border border-zinc-700 bg-zinc-900 text-sm hover:bg-zinc-800 font-medium">Save</button>
-                {!bot?.enabled ? <button onClick={startBot} disabled={!connected} className="flex-1 py-2.5 rounded-full bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white font-bold text-sm shadow-lg shadow-violet-600/20">▶ START</button> : <button onClick={stopBot} className="flex-1 py-2.5 rounded-full bg-red-500 hover:bg-red-400 text-white font-bold text-sm shadow">⏹ STOP</button>}
+              {risky && <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">Risk above 2% per trade can wipe a small account quickly.</p>}
+              <div className="mt-4 flex gap-2">
+                <button onClick={saveBot} className="btn-ghost flex-1">Save</button>
+                {!bot?.enabled ? <button onClick={startBot} disabled={!connected} className="btn-gold flex-1">▶ Start</button> : <button onClick={stopBot} className="btn-sell flex-1">⏹ Stop</button>}
               </div>
-              <p className="text-[11px] text-zinc-500 mt-2">EMA×RSI + ATR + ADX + session filter. Auto lot from balance × risk%.</p>
-            </div>
+              <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">EMA 9/21 + RSI + ATR + ADX on closed candles • 1 position max • SL/TP on every order.</p>
+            </section>
 
-            <div className="rounded-[20px] border border-zinc-800 bg-zinc-900/70 backdrop-blur p-5">
-              <h3 className="font-semibold text-sm">Manual Trade</h3>
-              <div className="grid grid-cols-2 gap-3 mt-3">
-                <button onClick={()=>doTrade('BUY')} disabled={!connected||trading} className="rounded-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-950 font-bold py-3">BUY</button>
-                <button onClick={()=>doTrade('SELL')} disabled={!connected||trading} className="rounded-full bg-red-500 hover:bg-red-400 disabled:opacity-40 text-white font-bold py-3">SELL</button>
+            <section className="card-pad">
+              <h3 className="font-semibold tracking-tight">Manual trade <span className="font-mono text-xs text-zinc-500">{symbol}</span></h3>
+              <div className="mt-3 flex items-center gap-3">
+                <input value={manualLot} onChange={e => setManualLot(e.target.value)} inputMode="decimal" className="input !w-24 font-mono" />
+                <label className="flex items-center gap-2 text-xs text-zinc-400"><input type="checkbox" checked={attachSlTp} onChange={e => setAttachSlTp(e.target.checked)} className="h-4 w-4 accent-amber-400" />Attach ATR SL/TP</label>
               </div>
-            </div>
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <button onClick={() => doTrade('BUY')} disabled={!connected || trading} className="btn-buy !py-3">BUY {tick?.ask ? money(tick.ask) : ''}</button>
+                <button onClick={() => doTrade('SELL')} disabled={!connected || trading} className="btn-sell !py-3">SELL {tick?.bid ? money(tick.bid) : ''}</button>
+              </div>
+            </section>
 
-            <div className="rounded-[20px] border border-zinc-800 bg-zinc-900/70 backdrop-blur overflow-hidden">
-              <div className="flex border-b border-zinc-800">
-                {(['positions','history','log'] as const).map(t=>
-                  <button key={t} onClick={()=>setTab(t as any)} className={`flex-1 py-2.5 text-xs font-bold uppercase tracking-[0.12em] ${tab===t?'text-white bg-zinc-800':'text-zinc-500 hover:text-zinc-300'}`}>{t}</button>
-                )}
+            <section className="card overflow-hidden">
+              <div className="flex border-b border-white/[0.06]">
+                {(['positions', 'history', 'log'] as const).map(t => (
+                  <button key={t} onClick={() => setTab(t)} className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-[0.14em] transition ${tab === t ? 'bg-white/[0.06] text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                    {t}{t === 'positions' && positions.length ? ` (${positions.length})` : ''}
+                  </button>
+                ))}
               </div>
-              <div className="p-3 max-h-[400px] overflow-auto">
-                {tab==='positions' && (positions.length===0?<p className="text-sm text-zinc-500 py-8 text-center">No open positions</p>:
-                  <div className="space-y-2">{positions.map((p:any)=>
-                    <div key={p.ticket} className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded-2xl px-3 py-2.5 text-sm">
-                      <div className="flex items-center gap-2"><span className={`text-xs font-bold px-2 py-0.5 rounded-full ${p.type==='BUY'?'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20':'bg-red-500/15 text-red-400 border border-red-500/20'}`}>{p.type}</span><span className="font-mono text-sm">{p.symbol} {p.volume}</span><span className={`font-mono ${p.profit>=0?'text-emerald-400':'text-red-400'}`}>{p.profit?.toFixed(2)}</span></div>
-                      <button onClick={()=>closePos(p.ticket)} className="text-xs px-3 py-1 rounded-full bg-zinc-800 hover:bg-zinc-700 border border-zinc-700">Close</button>
-                    </div>
-                  )}</div>
-                )}
-                {tab==='history' && (history.length===0?<p className="text-sm text-zinc-500 py-8 text-center">No history</p>:
-                  <div className="space-y-1 text-xs font-mono">{history.slice(-20).reverse().map((h:any,i:number)=><div key={i} className="flex justify-between border-b border-zinc-800 py-1.5"><span>{h.symbol} {h.type}</span><span className={h.profit>=0?'text-emerald-400':'text-red-400'}>{h.profit}</span></div>)}</div>
-                )}
-                {tab==='log' && (
-                  <div className="space-y-1 text-xs font-mono">
-                    {(bot?.stats.log||[]).slice().reverse().map((l:any,i:number)=><div key={i} className={`py-1 border-b border-zinc-800 ${l.type==='success'?'text-emerald-400':l.type==='error'?'text-red-400':l.type==='warn'?'text-amber-400':'text-zinc-400'}`}><span className="text-zinc-600">[{l.time}]</span> {l.msg}</div>)}
-                    {(bot?.stats.log||[]).length===0 && <p className="text-zinc-500 py-8 text-center">No logs — start the bot</p>}
-                  </div>
-                )}
+              <div className="max-h-[380px] overflow-auto p-3">
+                {tab === 'positions' && (positions.length === 0 ? <p className="py-10 text-center text-sm text-zinc-500">No open positions</p> : (
+                  <div className="space-y-2">{positions.map((p: any) => (
+                    <div key={p.ticket} className="flex items-center justify-between rounded-2xl border border-white/[0.06] bg-black/25 px-3 py-2.5 text-sm">
+                      <div className="flex items-center gap-2.5">
+                        <span className={`chip !py-0.5 font-bold ${p.type === 'BUY' ? 'border-emerald-400/25 bg-emerald-400/10 text-emerald-300' : 'border-rose-400/25 bg-rose-400/10 text-rose-300'}`}>{p.type}</span>
+                        <span className="font-mono">{p.symbol} {p.volume}</span>
+                        <span className={`font-mono ${tone(p.profit)}`}>{signed(p.profit)}</span>
+                      </div>
+                      <button onClick={() => closePos(p.ticket)} className="btn-ghost !px-3 !py-1 text-xs">Close</button>
+                    </div>))}</div>
+                ))}
+                {tab === 'history' && (history.length === 0 ? <p className="py-10 text-center text-sm text-zinc-500">No closed trades yet</p> : (
+                  <div className="font-mono text-xs">{history.slice(-25).reverse().map((h: any, i: number) => (
+                    <div key={i} className="flex justify-between border-b border-white/[0.05] py-2"><span className="text-zinc-300">{h.symbol} {h.type}{h.volume ? ` ${h.volume}` : ''}</span><span className={tone(h.profit)}>{signed(h.profit)}</span></div>
+                  ))}</div>
+                ))}
+                {tab === 'log' && ((st?.log || []).length === 0 ? <p className="py-10 text-center text-sm text-zinc-500">No log yet — start the bot</p> : (
+                  <div className="font-mono text-xs">{(st.log as any[]).slice().reverse().map((l, i) => (
+                    <div key={i} className={`border-b border-white/[0.05] py-1.5 ${l.type === 'success' ? 'text-emerald-300' : l.type === 'error' ? 'text-rose-300' : l.type === 'warn' ? 'text-amber-300' : 'text-zinc-400'}`}><span className="text-zinc-600">[{l.time}]</span> {l.msg}</div>
+                  ))}</div>
+                ))}
               </div>
-            </div>
-            <p className="text-[11px] text-zinc-600 text-center">API <code className="bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 rounded-full">{apiUrl('/api/status')}</code></p>
-          </div>
+            </section>
+          </aside>
         </div>
+        <p className="pb-6 text-center text-[11px] text-zinc-600">Trading gold with leverage is high risk. Test on a demo account first. Chart times are UTC.</p>
       </main>
     </div>
   );

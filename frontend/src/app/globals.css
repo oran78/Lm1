@@ -1,7 +1,34 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-* { scrollbar-width: thin; scrollbar-color: #27272a transparent; }
+
+:root { --gold: #f5b942; --gold-2: #ffd77a; --up: #34d399; --down: #f87171; }
+* { scrollbar-width: thin; scrollbar-color: #27272f transparent; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-thumb { background: #27272a; border-radius: 999px; }
-body { background: #09090b; color: #fafafa; }
+::-webkit-scrollbar-thumb { background: #27272f; border-radius: 999px; }
+html { color-scheme: dark; }
+body { background: #07070b; color: #f4f4f5; font-feature-settings: 'tnum' 1, 'cv11' 1; }
+
+@layer components {
+  .card { @apply rounded-3xl border border-white/[0.07] bg-white/[0.03] backdrop-blur-xl; }
+  .card-pad { @apply card p-5; }
+  .label { @apply text-[10.5px] font-semibold uppercase tracking-[0.16em] text-zinc-500; }
+  .input { @apply w-full rounded-2xl border border-white/10 bg-black/40 px-3.5 py-2.5 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-amber-400/50 focus:ring-2 focus:ring-amber-400/10; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-full px-5 py-2.5 text-sm font-semibold transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40; }
+  .btn-gold { @apply btn bg-gradient-to-b from-amber-300 to-amber-500 text-zinc-950 shadow-lg shadow-amber-500/20 hover:from-amber-200 hover:to-amber-400; }
+  .btn-ghost { @apply btn border border-white/10 bg-white/[0.04] text-zinc-200 hover:bg-white/[0.08]; }
+  .btn-buy { @apply btn bg-emerald-500 text-zinc-950 hover:bg-emerald-400; }
+  .btn-sell { @apply btn bg-rose-500 text-white hover:bg-rose-400; }
+  .chip { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium; }
+  .seg { @apply inline-flex rounded-full border border-white/10 bg-black/30 p-0.5; }
+  .seg > button { @apply rounded-full px-3 py-1 text-xs font-semibold text-zinc-500 transition hover:text-zinc-200; }
+  .seg > button[data-on='true'] { @apply bg-white/10 text-white; }
+}
+
+@keyframes flashUp { 0% { color: var(--up); text-shadow: 0 0 24px rgba(52,211,153,.55); } 100% { color: #fff; text-shadow: none; } }
+@keyframes flashDown { 0% { color: var(--down); text-shadow: 0 0 24px rgba(248,113,113,.55); } 100% { color: #fff; text-shadow: none; } }
+.flash-up { animation: flashUp .9s ease-out; }
+.flash-down { animation: flashDown .9s ease-out; }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.rise { animation: rise .35s ease-out both; }
+.gold-text { background: linear-gradient(180deg, #ffe39a, #f5b942 70%); -webkit-background-clip: text; background-clip: text; color: transparent; }
