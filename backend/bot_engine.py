@@ -7,6 +7,45 @@ from collections import deque
 from datetime import datetime, timezone
 
 from mt5_service import mt5_service
+try:
+    from metaapi_service import metaapi_service as _metaapi_bot
+    _HAS_METAAPI_BOT=True
+except:
+    _HAS_METAAPI_BOT=False
+    _metaapi_bot=None
+
+def _is_any_connected():
+    try:
+        if _HAS_METAAPI_BOT and _metaapi_bot and _metaapi_bot.is_connected(): return True
+    except: pass
+    return mt5_service.is_connected()
+
+def _any_account():
+    try:
+        if _HAS_METAAPI_BOT and _metaapi_bot and _metaapi_bot.is_connected():
+            a=_metaapi_bot.get_account_info()
+            if a: return a
+    except: pass
+    return mt5_service.get_account_info()
+
+def _any_tick(sym):
+    try:
+        if _HAS_METAAPI_BOT and _metaapi_bot and _metaapi_bot.is_connected():
+            t=_metaapi_bot.get_tick(sym)
+            if t and t.get("bid"): return t
+    except: pass
+    return mt5_service.get_tick(sym)
+
+def _any_candles(sym, tf, cnt):
+    # MetaApi has history via mt5? fallback to mt5_service live candles (gold-api) is fine for strategy
+    return mt5_service.get_candles(sym, tf, cnt)
+
+def _any_send_order(**kw):
+    try:
+        if _HAS_METAAPI_BOT and _metaapi_bot and _metaapi_bot.is_connected():
+            return _metaapi_bot.send_order(**kw)
+    except: pass
+    return mt5_service.send_order(**kw)
 from risk_engine import risk_engine
 from strategy import analyze_symbol
 
@@ -50,7 +89,7 @@ def _reset_daily_if_needed():
         _log(f"New day {today} — reset", "info")
 
 def get_bot_state():
-    acc=mt5_service.get_account_info()
+    acc=_any_account()
     bal=acc["balance"] if acc else bot_config["starting_balance"] or 0
     tgt=bot_config["target_balance"] or (bal*bot_config["target_multiplier"] if bal else 0)
     start=bot_config["starting_balance"] or bal
@@ -74,18 +113,18 @@ async def _loop():
     while bot_config["enabled"]:
         try:
             _reset_daily_if_needed()
-            acc=mt5_service.get_account_info()
+            acc=_any_account()
             if acc: bot_stats["equity_curve"].append({"t": int(time.time()), "equity": acc["equity"], "balance": acc["balance"]})
-            if not mt5_service.is_connected():
+            if not _is_any_connected():
                 _log("Not connected — waiting Exness login", "warn"); await asyncio.sleep(5); continue
             if bot_stats["trades_today"] >= bot_config["max_trades_per_day"]:
                 await asyncio.sleep(10); continue
 
             symbol=bot_config["symbol"]
-            candles=mt5_service.get_candles(symbol, bot_config["timeframe"], 100)
+            candles=_any_candles(symbol, bot_config["timeframe"], 100)
             if not candles or len(candles)<35: await asyncio.sleep(3); continue
 
-            tick=mt5_service.get_tick(symbol)
+            tick=_any_tick(symbol)
             spread=tick.get("spread",0) if tick else 0
             result=analyze_symbol(candles, spread=spread)
             bot_stats["last_signal"]=result.get("signal","HOLD"); bot_stats["last_reason"]=result.get("reason","")
@@ -98,7 +137,7 @@ async def _loop():
                 _log(f"Spread {spread} too high — skip {sig} (ATR {result.get('atr')})", "warn"); await asyncio.sleep(5); continue
 
             # lot calc ATR-aware
-            acc=mt5_service.get_account_info(); balance=acc["balance"] if acc else 10.0
+            acc=_any_account(); balance=acc["balance"] if acc else 10.0
             atr=result.get("atr",0.8) or 0.8
             # convert ATR to points: atr / 0.01
             sl_points_est = max(90, min(350, int(round((atr * bot_config["sl_atr_mult"]) / 0.01))))
@@ -120,7 +159,7 @@ async def _loop():
                 sl=price + sl_dist; tp=price - tp_dist
 
             _log(f"{sig} @ {price:.2f} ATR {atr_val:.2f} ADX {result.get('adx')} RSI {result.get('rsi')} lot {lot} → SL {sl:.2f} TP {tp:.2f} ({result.get('confidence',0)}%)", "info")
-            order=mt5_service.send_order(symbol=symbol, action=sig, volume=lot, sl=round(sl,2), tp=round(tp,2))
+            order=_any_send_order(symbol=symbol, action=sig, volume=lot, sl=round(sl,2), tp=round(tp,2))
             if order.get("status")=="success":
                 bot_stats["trades_today"]+=1; bot_stats["total_trades"]+=1; risk_engine.register_trade(lot)
                 bot_stats["markers"].append({"time": int(time.time()), "price": price, "type": sig, "lot": lot, "rsi": result.get("rsi"), "atr": atr_val})
@@ -129,7 +168,7 @@ async def _loop():
             else:
                 _log(f"Order failed: {order.get('message')}", "error"); await asyncio.sleep(6)
 
-            acc2=mt5_service.get_account_info()
+            acc2=_any_account()
             if acc2 and bot_config["target_balance"] and acc2["balance"]>=bot_config["target_balance"]:
                 _log(f"🎯 FLIP HIT! {acc2['balance']} >= {bot_config['target_balance']} — stopping", "success")
                 bot_config["enabled"]=False; break
@@ -142,7 +181,7 @@ async def _loop():
 def start_bot():
     global _task
     if bot_config["enabled"] and _task and not _task.done(): return get_bot_state()
-    acc=mt5_service.get_account_info()
+    acc=_any_account()
     if acc and not bot_config["starting_balance"]:
         bot_config["starting_balance"]=float(acc["balance"])
         bot_config["target_balance"]=round(bot_config["starting_balance"]*bot_config["target_multiplier"],2)

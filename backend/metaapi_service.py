@@ -84,10 +84,13 @@ class MetaApiService:
 
     def get_account_info(self):
         if not self._connected or not self.token: return None
-        # refresh balance from RPC
+        # cache 8s to avoid MetaApi rate limit
+        import time as _t
+        now=_t.time()
+        if hasattr(self, "_acc_cache_t") and now - self._acc_cache_t < 8 and getattr(self, "_acc_cache", None):
+            return self._acc_cache
         try:
             import httpx
-            # need region — fetch provisioning once
             with httpx.Client(timeout=6) as c:
                 r = c.get(f"https://mt-provisioning-api-v1.{DOMAIN}/users/current/accounts/{self.account_id}", headers=self._headers(), timeout=6)
                 if r.status_code == 200:
@@ -97,7 +100,9 @@ class MetaApiService:
                     if r2.status_code == 200:
                         j = r2.json()
                         bal = float(j.get("balance", self._account.get("balance",0)))
-                        return {"login": self._account.get("login"), "server": self._account.get("server"), "balance": bal, "equity": float(j.get("equity", bal)), "profit": float(j.get("profit",0)), "margin": float(j.get("margin",0)), "leverage": int(j.get("leverage",2000)), "currency": j.get("currency","USD"), "mode": "METAAPI"}
+                        acc={"login": self._account.get("login"), "server": self._account.get("server"), "balance": bal, "equity": float(j.get("equity", bal)), "profit": float(j.get("profit",0)), "margin": float(j.get("margin",0)), "leverage": int(j.get("leverage",2000)), "currency": j.get("currency","USD"), "mode": "METAAPI"}
+                        self._acc_cache=acc; self._acc_cache_t=now; self._account=acc
+                        return acc
         except: pass
         return self._account
 
@@ -116,20 +121,50 @@ class MetaApiService:
         return None
 
     def send_order(self, symbol, action, volume, sl=None, tp=None):
+        # MetaApi: symbol must be subscribed (stream), then trade via mt-client-api
+        # Ensure deployed+connected + subscribed, then POST trade
         try:
-            with httpx.Client(timeout=10) as c:
+            with httpx.Client(timeout=15) as c:
                 r = c.get(f"https://mt-provisioning-api-v1.{DOMAIN}/users/current/accounts/{self.account_id}", headers=self._headers(), timeout=6)
-                region = r.json().get("region") if r.status_code==200 else "london"
+                if r.status_code != 200:
+                    return {"status":"error","message": f"MetaApi provisioning {r.status_code}: {r.text[:300]}"}
+                j = r.json()
+                if j.get("connectionStatus") != "CONNECTED":
+                    logger.warning(f"MetaApi not CONNECTED yet: {j.get('connectionStatus')} state {j.get('state')} — waiting")
+                region = j.get("region") or "london"
                 host = f"https://mt-client-api-v1.{region}.agiliumtrade.ai"
-                payload={"symbol": symbol.upper(), "volume": float(volume), "actionType": "ORDER_TYPE_BUY" if action=="BUY" else "ORDER_TYPE_SELL"}
-                # SL/TP via price not supported here — backend will manage via close
-                rr=c.post(f"{host}/users/current/accounts/{self.account_id}/trade", headers=self._headers(), json=payload, timeout=10)
+                sym = symbol.upper()
+                # 1. ensure symbol subscribed (required before trade)
+                try:
+                    sub = c.post(f"{host}/users/current/accounts/{self.account_id}/symbols/{sym}/subscribe", headers=self._headers(), timeout=8)
+                    if sub.status_code not in (200,201,204):
+                        logger.debug(f"subscribe {sym} {sub.status_code}: {sub.text[:200]}")
+                except Exception as se:
+                    logger.debug(f"subscribe fail: {se}")
+                # 2. fetch current price for reliability log
+                # 3. trade — MetaApi expects {actionType, symbol, volume, ...} ; actionType is BUY/SELL enum
+                # Use same payload as docs; volume must meet broker min (Exness XAU 0.01)
+                payload={"symbol": sym, "volume": float(volume), "actionType": "ORDER_TYPE_BUY" if action=="BUY" else "ORDER_TYPE_SELL"}
+                # Include SL/TP if provided (MetaApi supports stopLoss/takeProfit in price units)
+                if sl is not None and float(sl) > 0:
+                    payload["stopLoss"] = float(sl)
+                if tp is not None and float(tp) > 0:
+                    payload["takeProfit"] = float(tp)
+                rr=c.post(f"{host}/users/current/accounts/{self.account_id}/trade", headers=self._headers(), json=payload, timeout=15)
+                body = rr.text
                 if rr.status_code in (200,201):
-                    j=rr.json()
-                    return {"status":"success","message": f"\u2705 LIVE MetaApi {action} {volume} {symbol} (REAL broker)", "ticket": j.get("orderId") or j.get("positionId"), "mode":"METAAPI"}
-                return {"status":"error","message": f"MetaApi trade {rr.status_code}: {rr.text[:400]}"}
+                    jj=rr.json() if body else {}
+                    # MetaApi returns {"orderId","positionId",...} async — but treat 2xx as queued
+                    tid = jj.get("orderId") or jj.get("positionId") or jj.get("stringCode") or "pending"
+                    logger.info(f"MetaApi trade queued {action} {sym} {volume} -> {jj}")
+                    return {"status":"success","message": f"\u2705 LIVE MetaApi {action} {volume} {sym} queued (REAL broker) — check Positions", "ticket": tid, "mode":"METAAPI", "raw": jj}
+                # verbose error
+                logger.warning(f"MetaApi trade fail {rr.status_code}: {body[:600]}")
+                # common: 400 Symbol not subscribed / 404 account not connected / 400 Trade disabled
+                return {"status":"error","message": f"MetaApi trade {rr.status_code}: {body[:600]}"}
         except Exception as e:
-            return {"status":"error","message": str(e)}
+            logger.exception("MetaApi send_order exception")
+            return {"status":"error","message": f"MetaApi error: {e}"}
 
     def get_positions(self):
         try:
