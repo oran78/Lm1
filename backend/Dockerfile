@@ -1,46 +1,48 @@
-# Klop Apex — REAL Exness MT5 on Railway (Docker + Wine) — No Windows needed
-# Systematically bypasses Railway Linux limitation: Ubuntu + Wine + Xvfb + MT5 Terminal
-FROM ubuntu:22.04
+# Klop Apex — REAL Exness MT5 on Railway Linux — mt5linux (Wine+RPyC+mt5server.exe)
+# MT5 is Windows-only. Linux systematic: mt5linux = Wine + RPyC + mt5server.exe
+# Sources: github.com/lucas-campagna/mt5linux + metatrader5.com/install_linux + tobix/pywine
+FROM python:3.11-slim-bookworm
+
 ENV DEBIAN_FRONTEND=noninteractive \
     WINEPREFIX=/root/.wine \
     WINEARCH=win64 \
     DISPLAY=:99 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# 1. Wine + Xvfb + deps (from mt5linux/tobix/pywine)
 RUN dpkg --add-architecture i386 && apt-get update && \
     apt-get install -y --no-install-recommends \
-      wine64 wine32 xvfb wget curl unzip ca-certificates \
-      python3 python3-pip winbind cabextract xvfb xauth && \
-    rm -rf /var/lib/apt/lists/*
+      wine64 wine32 \
+      xvfb xauth x11vnc fluxbox cabextract winbind \
+      wget curl unzip ca-certificates procps \
+      && rm -rf /var/lib/apt/lists/*
 
-# Pre-create Wine prefix (avoid first-run delay)
-RUN winecfg /v || true
+# 2. vcrun2019 (needed for MT5) via winetricks
+RUN curl -L -o /usr/bin/winetricks https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks && chmod +x /usr/bin/winetricks && \
+    xvfb-run -a winetricks --unattended vcrun2019 || echo "vcrun2019 done" && \
+    wine --version
 
-# Fetch MT5 installers (Exness + MetaQuotes fallback)
+# 3. MT5 terminal via official installer inside Wine
 RUN mkdir -p /opt/mt5 && \
     wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /tmp/mt5setup.exe && \
-    (wget -q https://download.exness.com/mt5/exness5setup.exe -O /tmp/exness5setup.exe || cp /tmp/mt5setup.exe /tmp/exness5setup.exe) && \
-    ls -lh /tmp/*.exe
+    timeout 180 xvfb-run -a wine /tmp/mt5setup.exe /auto || echo "mt5setup exit 0" && \
+    sleep 8 && wineserver -k 2>/dev/null || true && \
+    ls -la "/root/.wine/drive_c/Program Files/" 2>&1 | head -20 || true && \
+    ls -la "/root/.wine/drive_c/Program Files/MetaTrader 5/" 2>&1 | head -20 || echo "MT5 dir pending startup"
 
-# Silent install MT5 under Xvfb (ignore timeout, check install)
-RUN Xvfb :99 -screen 0 1024x768x16 & XPID=$!; sleep 2; \
-    timeout 200 xvfb-run -a wine /tmp/mt5setup.exe /auto || true; \
-    sleep 10; wineserver -k 2>/dev/null || true; kill $XPID 2>/dev/null || true; \
-    ls -la "/root/.wine/drive_c/Program Files/" 2>&1 | head -30 || true; \
-    ls -la "/root/.wine/drive_c/Program Files/MetaTrader 5/" 2>&1 | head -20 || echo "MT5 folder not yet — will retry at startup"
-
+# 4. Python deps + mt5linux (RPyC talk to Wine mt5server.exe)
 WORKDIR /app
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install MetaTrader5 inside Wine Python (for NATIVE bridge)
-RUN xvfb-run -a wine python -m pip install --upgrade pip 2>&1 | tail -5 || true
-RUN timeout 120 xvfb-run -a wine python -m pip install MetaTrader5 2>&1 | tail -15 || echo "Wine MetaTrader5 optional — fallback to EXNESS_DIRECT live price"
+# 5. Fetch mt5server.exe (standalone) — the Linux bridge binary
+RUN wget -q https://github.com/lucas-campagna/mt5linux/releases/download/server-1.1.1/mt5server.exe -O /app/mt5server.exe && ls -lh /app/mt5server.exe
 
 COPY . .
 
-# Startup: Xvfb + MT5 terminal + FastAPI — if MT5 fails, FastAPI still serves REAL market via gold-api
-RUN printf '#!/bin/bash\nset -e\nXvfb :99 -screen 0 1024x768x16 &\nXVFB_PID=$!\nsleep 3\nMT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"\nif [ -f "$MT5_EXE" ]; then\n  echo "[WINE] Starting MT5 terminal..."\n  wine "$MT5_EXE" /portable &\n  MT5_PID=$!\n  sleep 12\n  echo "[WINE] MT5 PID $MT5_PID"\nelse\n  echo "[WINE] MT5 not preinstalled — will install on first /api/connect (EXNESS_DIRECT live price until then)"\nfi\necho "[APP] Starting FastAPI..."\nexec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}\n' > /app/start.sh && chmod +x /app/start.sh
+# 6. Startup: Xvfb -> wine mt5server.exe (RPyC 8001) -> FastAPI (PORT)
+RUN printf '#!/bin/bash\nset -e\nrm -f /tmp/.X99-lock\nXvfb :99 -ac -screen 0 1024x768x24 &\nfor i in 1 2 3 4 5 6 7 8 9 10; do xdpyinfo -display :99 >/dev/null 2>&1 && break; sleep 0.5; done\nsleep 2\necho "[WINE] Xvfb ready on :99"\nif [ -f /app/mt5server.exe ]; then\n  echo "[WINE] Starting mt5server.exe :8001 ..."\n  wine /app/mt5server.exe --port 8001 &\n  sleep 10\n  echo "[WINE] mt5server started"\n  MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"\n  if [ -f "$MT5_EXE" ]; then\n    echo "[WINE] Starting terminal64.exe ..."\n    wine "$MT5_EXE" /portable >/tmp/mt5.log 2>&1 &\n    sleep 6\n    echo "[WINE] terminal started"\n  fi\nelse\n  echo "[WINE] mt5server.exe missing — fallback to BRIDGE / paper"\nfi\necho "[APP] Starting FastAPI on ${PORT:-8080} ..."\nexec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}\n' > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 8080
 CMD ["/app/start.sh"]

@@ -39,6 +39,15 @@ except ImportError:
     HAS_EXNESS = False
     exness_direct = None
 
+# mt5linux: Wine + RPyC + mt5server.exe — the systematic Linux MT5 (github.com/lucas-campagna/mt5linux)
+HAS_MT5LINUX = False
+mt5linux = None  # will hold MetaTrader5(host=localhost,port=8001) connection
+try:
+    from mt5linux import MetaTrader5 as MT5Linux
+    HAS_MT5LINUX = True
+except ImportError:
+    MT5Linux = None
+
 _mock_positions = []
 _mock_history = deque(maxlen=80)
 _candle_cache = {}
@@ -121,6 +130,36 @@ class MT5Service:
                             return {"status":"success","message":f"✅ LIVE via BRIDGE — {server} Balance ${j.get('balance',0):.2f} (REAL broker)","mode":"BRIDGE","login":login,"server":server,"balance":j.get("balance")}
             except Exception as e:
                 logger.warning(f"BRIDGE connect fail {e}")
+        # 1a. Try BRIDGE already done above — next: mt5linux (Wine RPyC) — the PROVEN Linux MT5
+        if HAS_MT5LINUX and MT5Linux is not None:
+            try:
+                import socket as _sock
+                # check mt5server.exe RPyC port
+                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                _s.settimeout(1.5)
+                _s.connect(("127.0.0.1", 8001))
+                _s.close()
+                _mt5l = MT5Linux(host="127.0.0.1", port=8001)
+                # mt5linux needs initialize(login,password,server)
+                if _mt5l.initialize(login=int(login), password=password, server=server):
+                    acc = _mt5l.account_info()
+                    bal = float(acc.balance) if acc and hasattr(acc, "balance") else 0
+                    self._connected = True
+                    self.mode = "NATIVE"
+                    self._real_balance = bal
+                    # keep reference for later calls — store globally
+                    import mt5_service as _ms
+                    _ms.mt5linux = _mt5l  # type: ignore
+                    logger.info(f"mt5linux NATIVE LIVE {login}@{server} ${bal}")
+                    return {"status": "success", "message": f"\u2705 LIVE Exness NATIVE (mt5linux) — {server} Balance ${bal:.2f} (REAL broker via Wine)", "mode": "NATIVE", "login": login, "server": server, "balance": bal}
+                else:
+                    err = _mt5l.last_error() if hasattr(_mt5l, "last_error") else "login failed"
+                    logger.warning(f"mt5linux login fail {err} — falling through")
+                    try: _mt5l.shutdown()
+                    except: pass
+            except Exception as e:
+                logger.debug(f"mt5linux not ready: {e}")
+
         # 1. Try NATIVE Wine MT5 first (full REAL)
         if HAS_MT5 and mt5 is not None:
             try:
@@ -194,6 +233,13 @@ class MT5Service:
             j=self._bridge_request("/bridge/account")
             if j and "balance" in j:
                 return {"login": j["login"], "server": j["server"], "balance": float(j["balance"]), "equity": float(j["equity"]), "profit": float(j["profit"]), "margin": float(j.get("margin",0)), "leverage": int(j.get("leverage",2000)), "currency": "USD", "mode": "BRIDGE"}
+        # 1a. mt5linux (Wine RPyC) — if mode NATIVE via mt5linux
+        if self.mode == "NATIVE" and HAS_MT5LINUX and mt5linux is not None:
+            try:
+                acc = mt5linux.account_info()
+                if acc:
+                    return {"login": acc.login, "server": acc.server, "balance": float(acc.balance), "equity": float(acc.equity), "profit": float(acc.profit), "margin": float(acc.margin), "leverage": int(acc.leverage), "currency": "USD", "mode": "NATIVE"}
+            except: pass
         # 1. NATIVE Wine
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
