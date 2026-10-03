@@ -16,6 +16,7 @@ from collections import deque
 class RiskEngine:
     def __init__(self):
         self.max_daily_loss_pct = 8.0
+        self.flip_mode = False
         self.min_lot = 0.01
         self.max_lot = 0.20
         self.lot_step = 0.01
@@ -53,7 +54,8 @@ class RiskEngine:
             if sl_dist:
                 risk_money = volume * self.contract_size * sl_dist
                 risk_pct = risk_money / balance * 100.0
-                if risk_pct > self.max_risk_pct_hard:
+                effective_cap = 35.0 if self.flip_mode else self.max_risk_pct_hard
+                if risk_pct > effective_cap:
                     return False, (f"Account too small: min lot {volume} with SL ${sl_dist:.2f} risks "
                                    f"${risk_money:.2f} = {risk_pct:.0f}% of balance (cap {self.max_risk_pct_hard:.0f}%)")
             if price:

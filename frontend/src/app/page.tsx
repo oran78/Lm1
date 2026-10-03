@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import TradingChart from '@/components/TradingChart';
 import XauHero, { XauStatus } from '@/components/XauHero';
 import { get, post, wsUrl } from '@/lib/api';
+import { toPlanned, toTrade } from '@/lib/types';
 
 const SERVERS = ['Exness-MT5Real', 'Exness-MT5Real2', 'Exness-MT5Real3', 'Exness-MT5Real4', 'Exness-MT5Real5', 'Exness-MT5Trial', 'Exness-MT5Trial6', 'Exness-MT5Trial9'];
 const SYMBOLS = ['XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY'];
@@ -67,8 +68,8 @@ export default function Page() {
 
   // bot form
   const [riskPct, setRiskPct] = useState('1'); const [targetMult, setTargetMult] = useState('2'); const [maxDay, setMaxDay] = useState('12');
-  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.6'); const [tpAtr, setTpAtr] = useState('2.8');
-  const [botTf, setBotTf] = useState<TF>('M5'); const [session, setSession] = useState(true);
+  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.2'); const [tpAtr, setTpAtr] = useState('1.8');
+  const [botTf, setBotTf] = useState<TF>('M5'); const [session, setSession] = useState(true); const [flipMode, setFlipMode] = useState(true);
   const [manualLot, setManualLot] = useState('0.01'); const [attachSlTp, setAttachSlTp] = useState(true); const [trading, setTrading] = useState(false);
   const hydrated = useRef(false);
 
@@ -82,7 +83,7 @@ export default function Page() {
     const c = b.config; hydrated.current = true;
     setRiskPct(String(c.risk_pct)); setTargetMult(String(c.target_multiplier)); setMaxDay(String(c.max_trades_per_day));
     setAutoLot(!!c.auto_lot); setFixedLot(String(c.fixed_lot)); setSlAtr(String(c.sl_atr_mult)); setTpAtr(String(c.tp_atr_mult));
-    setBotTf((c.timeframe || 'M5') as TF); setTf((c.timeframe || 'M5') as TF); setSession(!!c.session_filter);
+    setBotTf((c.timeframe || 'M5') as TF); setTf((c.timeframe || 'M5') as TF); setSession(!!c.session_filter); if (c.flip_mode !== undefined) setFlipMode(!!c.flip_mode);
     if (c.symbol && SYMBOLS.includes(c.symbol)) setSymbol(c.symbol);
   };
 
@@ -154,7 +155,7 @@ export default function Page() {
   };
 
   const num = (v: string) => parseFloat(v);
-  const botBody = () => ({ risk_pct: num(riskPct), target_multiplier: num(targetMult), max_trades_per_day: parseInt(maxDay), auto_lot: autoLot, fixed_lot: num(fixedLot), sl_atr_mult: num(slAtr), tp_atr_mult: num(tpAtr), symbol, timeframe: botTf, session_filter: session });
+  const botBody = () => ({ risk_pct: num(riskPct), target_multiplier: num(targetMult), max_trades_per_day: parseInt(maxDay), auto_lot: autoLot, fixed_lot: num(fixedLot), sl_atr_mult: num(slAtr), tp_atr_mult: num(tpAtr), symbol, timeframe: botTf, session_filter: session, flip_mode: flipMode });
   const validate = () => {
     if (!(num(riskPct) > 0 && num(riskPct) <= 5)) return 'Risk per trade must be between 0.1% and 5%';
     if (!(num(slAtr) > 0 && num(tpAtr) > 0)) return 'SL / TP multipliers must be above 0';
@@ -178,6 +179,15 @@ export default function Page() {
   };
   const closePos = async (t: any) => { try { const j = await post(`/api/close/${t}`); toast(j.status === 'error' ? 'err' : 'ok', j.message); } catch (e: any) { toast('err', e.message); } };
   const disconnect = async () => { try { await post('/api/disconnect'); } catch {} setConnected(false); setAcc(null); setXau(null); setShowConnect(true); };
+
+  // chart overlays: while the bot runs its telemetry is authoritative; otherwise fall back to the polled analysis / broker positions
+  const botSymbol: string = bot?.config?.symbol || symbol;
+  const planned = botSymbol !== symbol ? null
+    : bot?.enabled ? toPlanned(bot?.planned_setup)
+    : analysis?.state === 'PLANNED_SETUP' ? toPlanned({ side: analysis.planned_side, entry_price: analysis.planned_entry_price }) : null;
+  const livePos = positions.find(p => String(p.symbol || '').toUpperCase() === symbol.toUpperCase());
+  const trade = toTrade(bot?.active_trade && botSymbol === symbol ? bot.active_trade : livePos);
+  const chartPlanned = trade ? null : planned;       // planned line disappears the moment the trade triggers
 
   const st = bot?.stats; const sig = st?.last_signal || analysis?.signal || 'HOLD';
   const sigCls = sig === 'BUY' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300' : sig === 'SELL' ? 'border-rose-400/30 bg-rose-400/10 text-rose-300' : sig.includes('WARN') ? 'border-amber-400/30 bg-amber-400/10 text-amber-300' : 'border-white/10 bg-white/5 text-zinc-400';
@@ -281,16 +291,17 @@ export default function Page() {
                 </div>
                 <div className="flex items-center gap-2">
                   {candleSrc && <span className={`chip ${candleSrc === 'BROKER' ? 'border-emerald-400/25 bg-emerald-400/10 text-emerald-300' : 'border-amber-400/25 bg-amber-400/10 text-amber-300'}`} title={candleSrc === 'BROKER' ? 'Candles come from your broker' : 'Fallback public data (PAXG) — not your broker'}>{candleSrc === 'BROKER' ? 'Broker candles' : `Fallback: ${candleSrc}`}</span>}
+                  {(st?.last_state || analysis?.state) && <span className="chip border-white/10 bg-white/5 text-zinc-400" title="Strategy state">{(st?.last_state || analysis?.state).replace('_', ' ')}</span>}
                   <span className={`chip font-bold ${sigCls}`}>{sig.replace('_WARN', '')}{analysis?.confidence ? ` • ${analysis.confidence}%` : ''}</span>
                 </div>
               </div>
-              <div className="px-2 pb-2 pt-3"><TradingChart data={candles} markers={st?.markers} resetKey={`${symbol}-${tf}`} height={420} /></div>
+              <div className="px-2 pb-2 pt-3"><TradingChart data={candles} markers={st?.markers} planned={chartPlanned} trade={trade} resetKey={`${symbol}-${tf}`} height={420} /></div>
             </section>
 
             <section className="card-pad">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <Meter label="RSI 14" value={analysis?.rsi} max={100} mark={50} text={analysis?.rsi != null ? String(analysis.rsi) : '—'} hue={analysis?.rsi > 70 ? 'bg-rose-400' : analysis?.rsi < 30 ? 'bg-emerald-400' : 'bg-violet-400'} />
-                <Meter label="ADX 14" value={analysis?.adx} max={50} mark={18} text={analysis?.adx != null ? String(analysis.adx) : '—'} hue={analysis?.adx >= 18 ? 'bg-amber-400' : 'bg-zinc-600'} />
+                <Meter label="ADX 14" value={analysis?.adx} max={50} text={analysis?.adx != null ? String(analysis.adx) : '—'} hue="bg-amber-400" />
                 <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3"><div className="flex items-baseline justify-between"><span className="label">ATR 14</span><span className="font-mono text-sm font-semibold">{analysis?.atr ?? '—'}</span></div><p className="mt-2 font-mono text-[11px] text-zinc-500">SL ≈ ${analysis?.atr ? (analysis.atr * num(slAtr)).toFixed(2) : '—'} • TP ≈ ${analysis?.atr ? (analysis.atr * num(tpAtr)).toFixed(2) : '—'}</p></div>
                 <div className="rounded-2xl border border-white/[0.06] bg-black/20 p-3"><div className="flex items-baseline justify-between"><span className="label">EMA 9 / 21</span><span className={`font-mono text-sm font-semibold ${analysis?.ema9 > analysis?.ema21 ? 'text-emerald-400' : 'text-rose-400'}`}>{analysis?.ema9 > analysis?.ema21 ? '▲ bull' : analysis?.ema9 < analysis?.ema21 ? '▼ bear' : '—'}</span></div><p className="mt-2 font-mono text-[11px] text-zinc-500">{analysis?.ema9 ?? '—'} / {analysis?.ema21 ?? '—'}</p></div>
               </div>
@@ -299,7 +310,7 @@ export default function Page() {
             </section>
 
             <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              {[{ v: `${st?.trades_today ?? 0}/${bot?.config?.max_trades_per_day ?? 12}`, k: 'Trades today' }, { v: String(st?.wins ?? 0), k: 'Wins', c: 'text-emerald-400' }, { v: String(st?.losses ?? 0), k: 'Losses', c: 'text-rose-400' }, { v: `${st?.win_rate ?? 0}%`, k: 'Win rate' }].map((s, i) => (
+              {[{ v: `${st?.trades_today ?? 0}/${bot?.config?.max_trades_per_day ?? 12}`, k: 'Trades today' }, { v: String(st?.wins ?? 0), k: 'Wins', c: 'text-emerald-400' }, { v: String(st?.losses ?? 0), k: 'Losses', c: 'text-rose-400' }, { v: `${st?.win_rate ?? 0}%`, k: st ? `Win rate (${(st.wins || 0) + (st.losses || 0)} trades)` : 'Win rate' }].map((s, i) => (
                 <div key={i} className="card py-4 text-center"><p className={`font-mono text-xl font-semibold ${s.c || ''}`}>{s.v}</p><p className="label mt-0.5">{s.k}</p></div>
               ))}
             </section>
@@ -325,6 +336,13 @@ export default function Page() {
               <div className="mt-4 flex gap-2">
                 <button onClick={saveBot} className="btn-ghost flex-1">Save</button>
                 {!bot?.enabled ? <button onClick={startBot} disabled={!connected} className="btn-gold flex-1">▶ Start</button> : <button onClick={stopBot} className="btn-sell flex-1">⏹ Stop</button>}
+              </div>
+              <div className="mt-3 flex items-center justify-between rounded-xl border border-amber-400/20 bg-amber-400/10 p-2.5">
+                <div>
+                  <p className="text-xs font-semibold text-amber-300">$10 Flip Mode</p>
+                  <p className="text-[10px] text-zinc-400">Allows 0.01 lot on micro accounts (up to 35% risk cap)</p>
+                </div>
+                <input type="checkbox" checked={flipMode} onChange={e => setFlipMode(e.target.checked)} className="h-4 w-4 accent-amber-400" />
               </div>
               <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">EMA 9/21 + RSI + ATR + ADX on closed candles • 1 position max • SL/TP on every order.</p>
             </section>

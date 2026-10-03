@@ -1,3 +1,41 @@
+# Klop Apex v2.5 — Momentum Pullback Scalper + chart execution
+
+## Strategy (backend/strategy.py) — closed candles only
+* Bias: EMA9 > EMA21 and EMA21 rising -> BUY only; EMA9 < EMA21 and falling -> SELL only.
+* CHOP: |EMA9-EMA21| < 0.3 x ATR -> no trading.
+* `PLANNED_SETUP`: bias active, price within 0.75 ATR of / inside the EMA9-EMA21 zone, RSI(14) cooled to 42-58
+  (lowest/highest of the last 3 closed candles). `planned_entry_price = EMA9`.
+* Trigger: closed candle touches the zone and closes back beyond EMA9 with a real body or a rejection tail.
+  Blocked if spread > 35 points or > 0.5 x ATR. Max 1 open trade.
+* Trade plan (`plan_trade`): SL 1.2 x ATR, TP 1.8 x ATR (R:R 1.5). The stop is pushed beyond the pullback swing
+  (+0.1 ATR) when the swing is further away, TP is stretched to keep R:R >= 1.5, and the trade is skipped if the
+  stop would need > 2 x ATR.
+* Auto break-even (`break_even_sl`): at +1R the SL moves to entry +/- spread, once (MetaApi `POSITION_MODIFY`).
+* ADX is still reported for the UI but no longer gates trades.
+
+## Engine / telemetry
+* `bot.planned_setup` {side, entry_price} and `bot.active_trade` {ticket, side, lot, entry, sl, tp, be_active} are in
+  `/api/status` and `/ws/telemetry` (now every 1 s). Markers carry `ticket` and the REAL fill price from the broker
+  position, and are rebuilt from open positions after a restart.
+* Time-stop uses the broker's open time (survives restarts). Loop split into `_step()`.
+* Config defaults: SL 1.2 / TP 1.8 ATR, max spread 35 pts, `be_enabled`, `be_trigger_r` = 1.0.
+
+## MetaApi / safety
+* `modify_position()` added (MetaApi + paper + native MT5). Orders with SL/TP on the wrong side are rejected before
+  they reach the broker; volume is floored to the lot step (never rounded up). Gold symbol still resolved per account.
+* Removed the hard-coded 4141.5 fallback tick in main.py (no fabricated prices).
+
+## Frontend
+* `TradingChart`: amber dashed `TARGET ENTRY @ price`; TP green, SL red, BREAK-EVEN cyan lines; BUY/SELL arrows
+  labelled `BUY 0.03 @ 4141.50`. Lines/markers update in place (no chart reload). Types in `src/lib/types.ts`.
+* Not verified: `npm install && npm run build` (no network here) — only `tsc --noEmit` against stubbed React/Next types.
+
+## Tests
+`python backend/tests/test_strategy.py | test_engine.py | test_metaapi.py | test_chart_state.py` — all pass on
+SIMULATED data. Run one demo account before real money.
+
+---
+
 # Klop Apex v2.4 — MetaApi + XAUUSD activation, new frontend
 
 ## Why XAUUSD never became "active" after connecting MetaApi

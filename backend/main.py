@@ -9,7 +9,7 @@ try:
 except Exception as e:
     _lg.getLogger("klop").warning(f"mt5_service fallback (no crash): {e}")
     from types import SimpleNamespace
-    mt5_service = SimpleNamespace(is_connected=lambda: False, mode="REAL", get_account_info=lambda: None, get_tick=lambda s: {"symbol":s,"bid":4141.5,"ask":4141.8,"time":0,"spread":30.0}, get_candles=lambda *a, **k: [], get_positions=lambda: [], get_history=lambda *a, **k: [], send_order=lambda **k: {"status":"error","message":"Fallback — use MetaApi"}, close_position=lambda t: {"status":"error","message":"Fallback"}, connect=lambda *a, **k: {"status":"error","message":"Fallback"}, disconnect=lambda: None, set_balance=lambda b: None, _get_bridge_url=lambda: None)
+    mt5_service = SimpleNamespace(is_connected=lambda: False, mode="REAL", get_account_info=lambda: None, get_tick=lambda s: None, get_candles=lambda *a, **k: [], get_positions=lambda: [], get_history=lambda *a, **k: [], send_order=lambda **k: {"status":"error","message":"Fallback — use MetaApi"}, close_position=lambda t: {"status":"error","message":"Fallback"}, connect=lambda *a, **k: {"status":"error","message":"Fallback"}, disconnect=lambda: None, set_balance=lambda b: None, _get_bridge_url=lambda: None)
 try:
     from metaapi_service import metaapi_service
 except Exception as e:
@@ -22,7 +22,7 @@ import bot_engine
 
 logging.basicConfig(level=logging.INFO)
 logger=logging.getLogger("klop")
-app=FastAPI(title="Klop Apex API", description="Exness MT5 Auto Flip v2.4", version="2.4.0")
+app=FastAPI(title="Klop Apex API", description="Exness MT5 Pullback Scalper v2.5", version="2.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
@@ -46,9 +46,10 @@ class BotPatch(BaseModel):
     auto_lot: Optional[bool]=None; fixed_lot: Optional[float]=None; sl_atr_mult: Optional[float]=None; tp_atr_mult: Optional[float]=None
     symbol: Optional[str]=None; timeframe: Optional[str]=None; starting_balance: Optional[float]=None; session_filter: Optional[bool]=None
     max_hold_candles: Optional[int]=None; close_on_opposite: Optional[bool]=None; max_spread_points: Optional[float]=None
+    be_enabled: Optional[bool]=None; be_trigger_r: Optional[float]=None; flip_mode: Optional[bool]=None
 
 @app.get("/")
-def root(): return {"status":"ok","service":"Klop Apex","version":"2.4.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
+def root(): return {"status":"ok","service":"Klop Apex","version":"2.5.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/health")
 def health(): return {"status":"healthy","mt5": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/api/status")
@@ -131,7 +132,8 @@ def analysis(symbol: str="XAUUSD"):
     c,src=bot_engine._any_candles(symbol, tf, 120)
     if not c: return {"symbol":symbol,"signal":"HOLD","reason":"No data","data_source":src}
     t=bot_engine._any_tick(symbol) or {}
-    r=analyze_symbol(c, spread=t.get("spread"), session_filter=bot_engine.bot_config["session_filter"])
+    r=analyze_symbol(c, spread=t.get("spread"), session_filter=bot_engine.bot_config["session_filter"],
+                       max_spread_points=bot_engine.bot_config["max_spread_points"])
     r["symbol"]=symbol; r["data_source"]=src
     if t.get("bid"): r["price"]=t["bid"]
     return r
@@ -208,6 +210,6 @@ async def telemetry(ws: WebSocket, symbol: str = "XAUUSD"):
         while True:
             payload = await asyncio.to_thread(_telemetry_snapshot, symbols)   # blocking HTTP stays off the event loop
             await ws.send_text(json.dumps(payload))
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
     except (WebSocketDisconnect, RuntimeError):
         pass

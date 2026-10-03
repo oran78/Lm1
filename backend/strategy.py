@@ -1,15 +1,18 @@
 """
-Klop Apex — Scalper strategy v2.3 (fixed)
-EMA 9/21 + RSI 14 + ATR 14 + proper Wilder ADX 14 + session filter.
+Klop Apex — Momentum Pullback Scalper v2.5 (XAUUSD, M1/M5)
 
-Fixes vs v2.2:
-  * Signals are evaluated on the LAST CLOSED candle only (no repainting on the forming candle).
-  * ADX is now a real Wilder-smoothed ADX (v2.2 used raw DX, which is very noisy).
-  * EMA cross uses proper EMA series (previous value is exact).
-  * Added a 2nd setup (trend-continuation / EMA9 reclaim) so the bot can scalp more than only crosses.
-  * Spread filter is relative to ATR.
-  * `session_filter` config is honoured.
-  * Every result carries `candle_time` so the engine takes at most one trade per candle.
+Rules (all evaluated on CLOSED candles only — nothing repaints):
+  1. Trend bias   : EMA9 > EMA21 and EMA21 rising  -> BUY only
+                    EMA9 < EMA21 and EMA21 falling -> SELL only
+                    |EMA9 - EMA21| < 0.3 * ATR     -> CHOP, no trading
+  2. Planned setup: with a bias, price pulls back into / toward the EMA9-EMA21 zone while RSI(14) cools
+                    to 42-58  ->  state PLANNED_SETUP, planned_entry_price = EMA9
+  3. Trigger      : the closed candle touches the zone and closes with a rejection (bullish for BUY,
+                    bearish for SELL) back beyond EMA9  ->  signal BUY / SELL
+                    Blocked if spread > 35 points or > 0.5 * ATR.
+  4. Trade plan   : SL = 1.2 * ATR from entry (pushed past the pullback swing if needed, max 2 ATR), TP = 1.8 * ATR
+                    (stretched to keep R:R >= 1.5),
+                    break-even at +1R -> SL = entry +/- spread.   See plan_trade() / break_even_sl().
 """
 from datetime import datetime, timezone
 
@@ -106,71 +109,169 @@ def _session_ok(now=None):
     return False, f"Asian / low liquidity {h:02d}UTC — paused"
 
 
+# ---------------------------------------------------------------------------------------------- tunables
+CHOP_ATR_FRAC = 0.3        # |EMA9-EMA21| below this fraction of ATR  => CHOP
+SLOPE_BARS = 3             # EMA21 angle is measured over this many closed candles
+RSI_BAND = (42.0, 58.0)    # RSI must cool into this band during the pullback
+RSI_LOOKBACK = 3           # ...measured over the last N closed candles
+APPROACH_ATR = 0.75        # price within this many ATR of the zone counts as "pulling back"
+SWING_BARS = 3             # swing window = pullback candle(s) + trigger candle
+MAX_SPREAD_ATR = 0.5       # spread veto relative to ATR
+MIN_RR = 1.5
+SWING_BUFFER_ATR = 0.1     # stop sits this far beyond the swing extreme
+MAX_SL_ATR = 2.0           # skip the trade if the stop would need to be wider than this many ATR
+
+
+def _rsi_cooled(closes, side):
+    """Lowest (BUY) / highest (SELL) RSI over the last RSI_LOOKBACK closed candles."""
+    vals = [_rsi(closes[:len(closes) - k], 14) for k in range(RSI_LOOKBACK) if len(closes) - k > 15]
+    if not vals:
+        return 50.0
+    return min(vals) if side == "BUY" else max(vals)
+
+
+def _rejection(side, c, e9):
+    """Candle-close rejection. BUY: bullish close back above EMA9 with a real body or a lower-wick tail."""
+    rng = c["high"] - c["low"]
+    if rng <= 0:
+        return False, 0.0
+    body = abs(c["close"] - c["open"]) / rng
+    if side == "BUY":
+        wick = (min(c["open"], c["close"]) - c["low"]) / rng
+        ok = c["close"] > c["open"] and c["close"] > e9 and (body >= 0.4 or wick >= 0.4)
+    else:
+        wick = (c["high"] - max(c["open"], c["close"])) / rng
+        ok = c["close"] < c["open"] and c["close"] < e9 and (body >= 0.4 or wick >= 0.4)
+    return ok, max(body, wick)
+
+
 def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
-                   adx_min=18.0, now=None):
+                   max_spread_points=35.0, now=None):
     """
     candles : oldest -> newest. Last element is normally the still-forming candle (drop_forming=True).
     spread  : in points (price diff * 100), same unit the tick API returns.
+
+    Returns a dict. `signal` is BUY / SELL / HOLD. `state` is one of:
+      WARMUP, PAUSED, CHOP, NO_TREND, WATCH, PLANNED_SETUP, INVALIDATED, BLOCKED, TRIGGERED
+    PLANNED_SETUP carries `planned_side` and `planned_entry_price` (= EMA9).
     """
-    base = {"signal": "HOLD", "confidence": 0, "setup": None, "adx": 0, "atr": 0, "rsi": 50,
-            "pdi": 0, "mdi": 0, "candle_time": None, "spread": spread}
+    base = {"signal": "HOLD", "state": "WARMUP", "confidence": 0, "setup": None, "bias": None,
+            "planned_side": None, "planned_entry_price": None,
+            "adx": 0, "atr": 0, "rsi": 50, "pdi": 0, "mdi": 0, "candle_time": None, "spread": spread,
+            "swing_low": None, "swing_high": None}
     data = candles[:-1] if (drop_forming and candles) else list(candles or [])
     if len(data) < 40:
         return {**base, "reason": f"Loading candles ({len(data)}/40 closed)…"}
 
     closes = [c["close"] for c in data]
-    last, prev = data[-1], data[-2]
-    price = last["close"]
+    last = data[-1]
     e9s, e21s = _ema_series(closes, 9), _ema_series(closes, 21)
-    ema9, ema21, p_ema9, p_ema21 = e9s[-1], e21s[-1], e9s[-2], e21s[-2]
+    ema9, ema21 = e9s[-1], e21s[-1]
     rsi = _rsi(closes, 14)
     atr = _atr(data, 14)
     adx, pdi, mdi = _adx(data, 14)
     ok, session_label = _session_ok(now)
+    window = data[-SWING_BARS:]
+    swing_low, swing_high = min(c["low"] for c in window), max(c["high"] for c in window)
+    slope = (e21s[-1] - e21s[-1 - SLOPE_BARS]) / SLOPE_BARS if len(e21s) > SLOPE_BARS else 0.0
+    gap = abs(ema9 - ema21)
 
-    out = {**base, "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 3),
+    out = {**base, "price": round(last["close"], 2), "rsi": round(rsi, 1), "atr": round(atr, 3),
            "adx": round(adx, 1), "pdi": round(pdi, 1), "mdi": round(mdi, 1),
-           "ema9": round(ema9, 2), "ema21": round(ema21, 2), "session": session_label,
-           "candle_time": last.get("time")}
+           "ema9": round(ema9, 2), "ema21": round(ema21, 2), "ema_gap": round(gap, 3),
+           "ema_slope": round(slope, 4), "session": session_label, "candle_time": last.get("time"),
+           "swing_low": swing_low, "swing_high": swing_high}
 
     if session_filter and not ok:
-        return {**out, "reason": f"⏸ {session_label} — bot paused (London+NY only)"}
+        return {**out, "state": "PAUSED", "reason": f"⏸ {session_label} — bot paused (London+NY only)"}
     if atr <= 0:
-        return {**out, "reason": "ATR is zero — no volatility data"}
-    if spread and (spread / 100.0) > atr * 0.25:
-        return {**out, "reason": f"Spread {spread/100.0:.2f} > 25% of ATR {atr:.2f} — skip"}
+        return {**out, "state": "WARMUP", "reason": "ATR is zero — no volatility data"}
+    if gap < CHOP_ATR_FRAC * atr:
+        return {**out, "state": "CHOP", "reason": f"CHOP — EMA gap {gap:.2f} < {CHOP_ATR_FRAC} × ATR {atr:.2f} • no trade"}
 
-    ema_gap = abs(ema9 - ema21)
-    min_gap = atr * 0.18
+    if ema9 > ema21 and slope > 0:
+        side = "BUY"
+    elif ema9 < ema21 and slope < 0:
+        side = "SELL"
+    else:
+        return {**out, "state": "NO_TREND", "reason": "EMAs aligned but EMA21 is not sloping with the trend — no bias"}
+    out["bias"] = side
 
-    if adx < adx_min:
-        return {**out, "reason": f"Choppy — ADX {adx:.1f} < {adx_min:.0f} • {session_label}"}
-    if rsi > 78 or rsi < 22:
-        return {**out, "signal": "OVERBOUGHT_WARN" if rsi > 78 else "OVERSOLD_WARN",
-                "reason": f"{'Overbought' if rsi > 78 else 'Oversold'} RSI {rsi:.1f} — waiting pullback"}
+    zone_hi, zone_lo = max(ema9, ema21), min(ema9, ema21)
+    if side == "BUY":
+        invalid = last["close"] < zone_lo
+        dist = last["low"] - zone_hi           # <= 0 => candle reached the zone
+        touched = last["low"] <= zone_hi and last["high"] >= zone_lo
+    else:
+        invalid = last["close"] > zone_hi
+        dist = zone_lo - last["high"]
+        touched = last["high"] >= zone_lo and last["low"] <= zone_hi
+    if invalid:
+        return {**out, "state": "INVALIDATED",
+                "reason": f"{side} pullback invalidated — candle closed through the whole EMA zone"}
 
-    bull_cross = ema9 > ema21 and p_ema9 <= p_ema21
-    bear_cross = ema9 < ema21 and p_ema9 >= p_ema21
+    pb_rsi = _rsi_cooled(closes, side)
+    out["pullback_rsi"] = round(pb_rsi, 1)
+    if dist > APPROACH_ATR * atr:
+        return {**out, "state": "WATCH", "reason": f"{side} bias — waiting for a pullback to the EMA zone ({dist:.2f} away)"}
+    if not (RSI_BAND[0] <= pb_rsi <= RSI_BAND[1]):
+        return {**out, "state": "WATCH",
+                "reason": f"{side} bias — pullback RSI {pb_rsi:.1f} outside {RSI_BAND[0]:.0f}-{RSI_BAND[1]:.0f}"}
 
-    # Setup 1: fresh EMA cross with trend confirmation
-    if bull_cross and ema_gap >= min_gap * 0.5 and 35 < rsi < 68 and pdi > mdi:
-        return {**out, "signal": "BUY", "setup": "EMA_CROSS",
-                "confidence": min(95, int(55 + (adx - adx_min) * 1.6 + (68 - rsi) * 0.4)),
-                "reason": f"BUY ▶ EMA9×EMA21 cross • RSI {rsi:.1f} • ADX {adx:.1f} • ATR {atr:.2f}"}
-    if bear_cross and ema_gap >= min_gap * 0.5 and 32 < rsi < 65 and mdi > pdi:
-        return {**out, "signal": "SELL", "setup": "EMA_CROSS",
-                "confidence": min(95, int(55 + (adx - adx_min) * 1.6 + (rsi - 32) * 0.4)),
-                "reason": f"SELL ▼ EMA9×EMA21 cross • RSI {rsi:.1f} • ADX {adx:.1f} • ATR {atr:.2f}"}
+    rejected, quality = _rejection(side, last, ema9) if touched else (False, 0.0)
+    if not rejected:
+        return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
+                "reason": f"PLANNED {side} — target entry @ {ema9:.2f} (EMA9) • RSI {pb_rsi:.1f} • waiting for rejection close"}
 
-    # Setup 2: trend continuation — price dipped under EMA9 and the last candle reclaimed it
-    if adx >= adx_min + 2 and ema_gap >= min_gap:
-        if (ema9 > ema21 and pdi > mdi and prev["close"] < p_ema9 and last["close"] > ema9
-                and last["close"] > last["open"] and 42 < rsi < 66):
-            return {**out, "signal": "BUY", "setup": "PULLBACK", "confidence": min(85, int(50 + adx)),
-                    "reason": f"BUY ▶ pullback reclaimed EMA9 • RSI {rsi:.1f} • ADX {adx:.1f}"}
-        if (ema9 < ema21 and mdi > pdi and prev["close"] > p_ema9 and last["close"] < ema9
-                and last["close"] < last["open"] and 34 < rsi < 58):
-            return {**out, "signal": "SELL", "setup": "PULLBACK", "confidence": min(85, int(50 + adx)),
-                    "reason": f"SELL ▼ pullback rejected at EMA9 • RSI {rsi:.1f} • ADX {adx:.1f}"}
+    # ---- trigger: spread gate
+    sp_price = (spread or 0) / 100.0
+    if spread and spread > max_spread_points:
+        return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {spread:.0f} pts > {max_spread_points:.0f}"}
+    if sp_price > MAX_SPREAD_ATR * atr:
+        return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {sp_price:.2f} > {MAX_SPREAD_ATR} × ATR {atr:.2f}"}
 
-    return {**out, "reason": f"HOLD — ADX {adx:.1f} RSI {rsi:.1f} gap {ema_gap:.2f} • {session_label}"}
+    conf = int(min(95, 55 + 20 * min(1.0, gap / atr) + 20 * quality))
+    return {**out, "signal": side, "state": "TRIGGERED", "setup": "EMA_PULLBACK", "confidence": conf,
+            "reason": f"{side} ▶ EMA-zone rejection • RSI {pb_rsi:.1f} • ATR {atr:.2f} • spread {spread if spread is not None else '—'}"}
+
+
+def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, tp_mult=1.8, min_rr=MIN_RR):
+    """
+    Base plan: SL = sl_mult*ATR from entry (1.2), TP = tp_mult*ATR (1.8)  -> R:R 1.5.
+    The stop must sit BEYOND the pullback swing. If the swing is further away than the base stop, the stop is
+    pushed past the swing (+ SWING_BUFFER_ATR) and TP is stretched to keep R:R >= min_rr.
+    A stop wider than MAX_SL_ATR * ATR means the pullback was too deep -> (None, reason).
+    """
+    if atr <= 0 or sl_mult <= 0 or tp_mult <= 0:
+        return None, "invalid ATR / multipliers"
+    if tp_mult / sl_mult < min_rr - 1e-9:
+        return None, f"R:R {tp_mult / sl_mult:.2f} below minimum {min_rr}"
+    risk = atr * sl_mult
+    if side == "BUY" and swing_low is not None:
+        risk = max(risk, entry - swing_low + SWING_BUFFER_ATR * atr)
+    elif side == "SELL" and swing_high is not None:
+        risk = max(risk, swing_high - entry + SWING_BUFFER_ATR * atr)
+    if risk > MAX_SL_ATR * atr:
+        return None, f"stop beyond the swing needs {risk:.2f} (> {MAX_SL_ATR} × ATR {atr:.2f}) — pullback too deep"
+    reward = max(atr * tp_mult, min_rr * risk)
+    sl, tp = (entry - risk, entry + reward) if side == "BUY" else (entry + risk, entry - reward)
+    return {"sl": round(sl, 2), "tp": round(tp, 2), "risk": risk, "reward": reward, "rr": round(reward / risk, 2)}, "ok"
+
+
+def break_even_sl(side, entry, sl, bid, ask, trigger_r=1.0):
+    """
+    New stop-loss price once floating profit >= trigger_r * initial risk, else None.
+    BUY -> entry + spread, SELL -> entry - spread. Returns None when the stop is already at/after entry.
+    """
+    if not sl or not entry:
+        return None
+    spread_px = max(ask - bid, 0.0)
+    if side == "BUY":
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        return round(entry + spread_px, 2) if (bid - entry) >= trigger_r * risk else None
+    risk = sl - entry
+    if risk <= 0:
+        return None
+    return round(entry - spread_px, 2) if (entry - ask) >= trigger_r * risk else None

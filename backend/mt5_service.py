@@ -418,6 +418,28 @@ class MT5Service:
                 if p.get("sl") and px>=p["sl"]: self._paper_close(p, p["sl"])
                 elif p.get("tp") and px<=p["tp"]: self._paper_close(p, p["tp"])
 
+    def modify_position(self, ticket, sl=None, tp=None, symbol=None):
+        """Move SL/TP of an open position (auto break-even)."""
+        if _get_bridge_url() or BRIDGE_URL:
+            return {"status": "error", "message": "SL/TP modify is not supported through the bridge"}
+        if HAS_MT5 and self.mode == "NATIVE" and mt5 is not None:
+            try:
+                poss = [p for p in (mt5.positions_get() or []) if str(p.ticket) == str(ticket)]
+                if not poss: return {"status": "error", "message": "Position not found on broker"}
+                p = poss[0]
+                req = {"action": mt5.TRADE_ACTION_SLTP, "position": p.ticket, "symbol": p.symbol,
+                       "sl": float(sl) if sl else float(p.sl), "tp": float(tp) if tp else float(p.tp)}
+                res = mt5.order_send(req)
+                if res and res.retcode in (mt5.TRADE_RETCODE_DONE, 10009): return {"status": "success", "message": f"Modified #{ticket}"}
+                return {"status": "error", "message": f"Modify fail: {res.comment if res else mt5.last_error()}"}
+            except Exception as e: return {"status": "error", "message": str(e)}
+        for p in _mock_positions:
+            if str(p["ticket"]) == str(ticket):
+                if sl: p["sl"] = float(sl)
+                if tp: p["tp"] = float(tp)
+                return {"status": "success", "message": f"Modified paper #{ticket}"}
+        return {"status": "error", "message": "Position not found"}
+
     def close_position(self, ticket: int):
         if _get_bridge_url() or BRIDGE_URL:
             j=self._bridge_request(f"/bridge/close/{ticket}","POST",None)

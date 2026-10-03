@@ -79,6 +79,24 @@ cb = [b for m, u, b, _ in CALLS if m == "POST"][-1]
 assert r["status"] == "success" and r["profit"] == 0.6 and cb == {"actionType": "POSITION_CLOSE_ID", "positionId": "77"}, (r, cb)
 print("positions/close OK")
 
+# 5b) break-even: POSITION_MODIFY keeps TP, rounds to the symbol digits, reports broker rejections
+ROUTES[("POST", "/trade")] = (200, {"numericCode": 10009, "stringCode": "TRADE_RETCODE_DONE"})
+r = svc.modify_position("77", sl=4140.45678, tp=4144.0, symbol="XAUUSD")
+mb = [b for m, u, b, _ in CALLS if m == "POST"][-1]
+assert r["status"] == "success" and mb == {"actionType": "POSITION_MODIFY", "positionId": "77", "stopLoss": 4140.457, "takeProfit": 4144.0}, (r, mb)
+ROUTES[("POST", "/trade")] = (200, {"numericCode": 10016, "stringCode": "TRADE_RETCODE_INVALID_STOPS", "message": "Invalid stops"})
+assert svc.modify_position("77", sl=4140.4, tp=4144.0, symbol="XAUUSD")["status"] == "error"
+print("modify (break-even) OK")
+
+# 5c) SL/TP on the wrong side never reach the broker; volume is floored to the lot step (risk is never rounded UP)
+n_before = len(CALLS)
+assert svc.send_order("XAUUSD", "BUY", 0.01, sl=4150.0, tp=4140.0)["status"] == "error" and len(CALLS) == n_before
+ROUTES[("POST", "/trade")] = (200, {"numericCode": 10009, "stringCode": "TRADE_RETCODE_DONE", "positionId": "78"})
+svc.send_order("XAUUSD", "SELL", 0.039, sl=4145.0, tp=4135.0)
+sb = [b for m, u, b, _ in CALLS if m == "POST"][-1]
+assert sb["volume"] == 0.03 and sb["stopLoss"] == 4145.0 and sb["takeProfit"] == 4135.0 and sb["actionType"] == "ORDER_TYPE_SELL", sb
+print("order SL/TP validation + lot floor OK")
+
 # 6) positions failure must raise (engine then refuses to open blind)
 ROUTES[("GET", "/positions")] = (500, {})
 try: svc.get_positions(); raise SystemExit("should raise")

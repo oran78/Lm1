@@ -48,7 +48,7 @@ be._any_send_order=spy
 
 async def main():
     be.start_bot()
-    END=T0+30*3600
+    END=T0+45*3600
     while vt[0]<END and be.bot_config["enabled"]:
         await real_sleep(0)
         open_hist.append(len(m._mock_positions))

@@ -270,11 +270,15 @@ class MetaApiService:
             return {"status": "error", "message": f"{symbol} not found in this MetaApi account's symbols (Market Watch). Available e.g.: {', '.join(self._broker_symbols[:8])}"}
         spec = self.get_spec(bsym)
         step, vmin, vmax = float(spec.get("volumeStep") or 0.01), float(spec.get("minVolume") or 0.01), float(spec.get("maxVolume") or 100)
-        vol = round(max(vmin, min(vmax, round(float(volume) / step) * step)), 2)
-        body = {"symbol": bsym, "volume": vol, "actionType": "ORDER_TYPE_BUY" if action.upper() == "BUY" else "ORDER_TYPE_SELL"}
+        vol = round(max(vmin, min(vmax, int(float(volume) / step + 1e-9) * step)), 2)   # floor to the lot step, never round UP the risk
+        is_buy = action.upper() == "BUY"
+        body = {"symbol": bsym, "volume": vol, "actionType": "ORDER_TYPE_BUY" if is_buy else "ORDER_TYPE_SELL"}
         digits = int(spec.get("digits") or 2)
         if sl and float(sl) > 0: body["stopLoss"] = round(float(sl), digits)
         if tp and float(tp) > 0: body["takeProfit"] = round(float(tp), digits)
+        s_, t_ = body.get("stopLoss"), body.get("takeProfit")
+        if s_ and t_ and ((is_buy and not s_ < t_) or (not is_buy and not t_ < s_)):
+            return {"status": "error", "message": f"Invalid SL/TP for {action.upper()}: SL {s_} / TP {t_}"}
         try:
             with httpx.Client(timeout=15) as c:
                 rr = self._trade_post(c, body)
@@ -292,6 +296,26 @@ class MetaApiService:
         except Exception as e:
             logger.exception("send_order failed")
             return {"status": "error", "message": f"MetaApi error: {e}"}
+
+    def modify_position(self, ticket, sl=None, tp=None, symbol=None):
+        """Move SL/TP of an open position (used for auto break-even). Sends POSITION_MODIFY to MetaApi."""
+        if not self._connected: return {"status": "error", "message": "MetaApi not connected"}
+        bsym = self.resolve(symbol) if symbol else None
+        digits = int((self.get_spec(bsym) or {}).get("digits") or 2) if bsym else 2
+        body = {"actionType": "POSITION_MODIFY", "positionId": str(ticket)}
+        if sl and float(sl) > 0: body["stopLoss"] = round(float(sl), digits)
+        if tp and float(tp) > 0: body["takeProfit"] = round(float(tp), digits)
+        try:
+            with httpx.Client(timeout=12) as c:
+                rr = self._trade_post(c, body, timeout=12)
+                try: j = rr.json()
+                except Exception: j = {}
+                code = j.get("stringCode") or ""
+                if rr.status_code in (200, 201) and (code in _OK_CODES or not code):
+                    return {"status": "success", "message": f"Modified #{ticket}: SL {body.get('stopLoss')} TP {body.get('takeProfit')}"}
+                return {"status": "error", "message": f"Modify rejected: {code or rr.status_code} — {j.get('message') or rr.text[:200]}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     def get_positions(self):
         if not self._connected: return []
