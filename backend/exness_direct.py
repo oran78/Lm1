@@ -1,32 +1,18 @@
 """
-Klop Apex — Exness Direct Bridge (REAL, No Wine, No MetaApi)
-Bypasses Railway Linux limitation: talks directly to Exness Web/MT5 servers via HTTPS+WSS
-- Authenticates against Exness Personal Area
-- Fetches REAL MT5 accounts + balances
-- Routes trades via Exness/MT5 gateway (with MT5 socket fallback)
-If Wine MT5 is present, mt5_service will prefer NATIVE; otherwise this is the REAL path.
+Klop Apex — Exness Direct Bridge (honest)
+Railway Linux CANNOT fetch Exness PA directly — my.exness.com is Cloudflare-protected.
+httpx gets 403 cf-challenge, so numeric MT5 -> balance $0 is expected on Railway.
+REAL paths that actually work:
+  1. BRIDGE_URL (Windows bridge_windows.py) -> NATIVE broker via your VPS
+  2. Wine MT5 on Railway (Dockerfile + Xvfb) -> NATIVE on Railway
+  3. Sync Balance (manual) -> PAPER on live $4141 price (chart/signals are still REAL)
+This module keeps EXNESS_DIRECT for honesty: logs Cloudflare block, does NOT fake balance.
+If cloudscraper is installed, it will try CF bypass automatically.
 """
-import httpx
 import logging
 import time
-import re
-
 logger = logging.getLogger("klop.exness")
 
-EXNESS_LOGIN_URLS = [
-    "https://my.exness.com/api/authorization/authorize",
-    "https://my.exness.com/apiv2/auth/login",
-    "https://my.exness.com/api/v2/auth/login",
-]
-
-EXNESS_ACCOUNTS_URLS = [
-    "https://my.exness.com/api/accounts",
-    "https://my.exness.com/apiv2/accounts",
-    "https://my.exness.com/api/v2/accounts/list",
-]
-
-# MT5 server hosts by name (Exness publishes these — we connect directly via MT5 protocol over 443)
-# If direct socket auth works, we can do full NATIVE without Wine.
 EXNESS_MT5_HOSTS = {
     "Exness-MT5Real": "77.242.96.10:443",
     "Exness-MT5Real2": "77.242.96.11:443",
@@ -37,11 +23,12 @@ EXNESS_MT5_HOSTS = {
 class ExnessDirect:
     def __init__(self):
         self.session_token = None
-        self.cookies = {}
         self.accounts = []
         self.mt5_login = None
         self.mt5_server = None
         self.mt5_password = None
+        self._cf_blocked = False
+        self._last_cf_reason = None
 
     def _headers(self):
         h = {
@@ -58,93 +45,97 @@ class ExnessDirect:
 
     def login(self, mt5_login: int, password: str, server: str) -> dict:
         """
-        Deep bypass: Try 3 paths in order:
-        1. Exness Personal Area auth (email+password) — if user gave PA credentials
-        2. MT5 direct socket handshake to Exness MT5 host:443
-        3. Validate MT5 creds format and return REAL mode with live price proof
+        Honest: Numeric MT5 login on Railway Linux CANNOT become REAL balance
+        without BRIDGE or Wine — Exness PA is Cloudflare Turnstile protected.
+        We store creds, check MT5 host reachable, and return REAL_DIRECT (paper on live price).
         """
-        self.mt5_login = int(mt5_login)
+        self.mt5_login = int(mt5_login) if str(mt5_login).isdigit() else mt5_login
         self.mt5_server = server
         self.mt5_password = password
 
-        # Path 1: Try Exness PA auth — this gives REAL balance if user pasted PA email
-        # Most users give MT5 login (numeric) not PA email — so this will fail, we fall through
+        # Try Cloudflare bypass only if cloudscraper available — otherwise log and skip
         is_email = "@" in str(mt5_login)
         if is_email:
-            for url in EXNESS_LOGIN_URLS:
-                try:
-                    with httpx.Client(timeout=8, follow_redirects=True) as c:
-                        r = c.post(url, json={"login": str(mt5_login), "password": password}, headers=self._headers())
-                        if r.status_code in (200, 201):
-                            j = r.json()
-                            token = j.get("token") or j.get("access_token") or j.get("data", {}).get("token")
-                            if token:
-                                self.session_token = token
-                                logger.info(f"Exness PA auth OK via {url}")
-                                return {"ok": True, "mode": "EXNESS_API", "token": token}
-                except Exception as e:
-                    logger.debug(f"PA auth {url} fail: {e}")
+            tried_cf = self._try_cf_bypass(str(mt5_login), password)
+            if tried_cf.get("ok"):
+                return tried_cf
+            self._cf_blocked = True
+            self._last_cf_reason = tried_cf.get("reason", "Cloudflare challenge — Railway cannot pass Turnstile")
 
-        # Path 2: MT5 direct TCP handshake (pure Python bypass of Wine)
-        # We do a minimal MT5 auth packet — if server responds, creds are valid
-        # This is the deep bypass: no Wine, no MetaTrader5 pip, just socket
+        # MT5 TCP reachability = server exists, NOT credential validation
         host = EXNESS_MT5_HOSTS.get(server)
         if host:
             try:
                 import socket
                 h, port = host.split(":")
-                port = int(port)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(4)
-                s.connect((h, port))
-                # MT5 server speaks binary — just checking TCP open proves server reachable
-                # Full MT5 auth is proprietary; we validate TCP + fall through to REAL price mode
+                s.settimeout(3)
+                s.connect((h, int(port)))
                 s.close()
-                logger.info(f"MT5 host {host} reachable for {server}")
+                logger.info(f"MT5 host {host} reachable — creds stored, live price mode")
             except Exception as e:
-                logger.debug(f"MT5 socket {host} fail: {e}")
+                logger.debug(f"MT5 socket {host} unreachable: {e}")
 
-        # Path 3: Always return REAL mode for Railway — live price + credential stored
-        # Balance will be fetched via PA API on next call if token exists, else user sees REAL market + paper until they provide PA email or deploy Wine
-        # BUT we mark it REAL (not MOCK) because price is live
-        return {"ok": True, "mode": "REAL_DIRECT", "note": "Socket bypass active — live price, balance via Exness API on next sync"}
+        return {"ok": True, "mode": "REAL_DIRECT", "cf_blocked": self._cf_blocked, "note": "Railway Linux: Cloudflare blocks Exness PA — balance needs BRIDGE/Wine or Sync"}
+
+    def _try_cf_bypass(self, email: str, password: str) -> dict:
+        """Attempt PA auth via cloudscraper if installed; otherwise report CF block."""
+        urls = [
+            "https://my.exness.com/api/authorization/authorize",
+            "https://my.exness.com/apiv2/auth/login",
+        ]
+        # Try cloudscraper first (handles CF Turnstile better than httpx)
+        try:
+            import cloudscraper  # type: ignore
+            scraper = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows","mobile":False})
+            for url in urls:
+                try:
+                    r = scraper.post(url, json={"login": email, "password": password}, headers=self._headers(), timeout=10)
+                    if r.status_code in (200, 201):
+                        j = r.json()
+                        token = j.get("token") or j.get("access_token") or j.get("data",{}).get("token")
+                        if token:
+                            self.session_token = token
+                            logger.info(f"Exness PA via cloudscraper OK {url}")
+                            return {"ok": True, "mode": "EXNESS_API", "token": token}
+                    elif r.status_code == 403 and "cloudflare" in r.text.lower():
+                        return {"ok": False, "reason": f"CF 403 at {url}"}
+                except Exception as e:
+                    logger.debug(f"cloudscraper PA {url} fail: {e}")
+        except ImportError:
+            pass
+        # Fallback httpx — will almost always get 403
+        try:
+            import httpx
+            for url in urls:
+                try:
+                    with httpx.Client(timeout=8, follow_redirects=True) as c:
+                        r = c.post(url, json={"login": email, "password": password}, headers=self._headers())
+                        body = r.text.lower()
+                        if r.status_code == 403 and ("cloudflare" in body or "cf-challenge" in body or "turnstile" in body):
+                            logger.warning(f"Exness PA Cloudflare blocked at {url} — need BRIDGE/Wine")
+                            return {"ok": False, "reason": f"Cloudflare 403 at {url}"}
+                        if r.status_code in (200, 201):
+                            j = r.json()
+                            token = j.get("token") or j.get("access_token") or j.get("data",{}).get("token")
+                            if token:
+                                self.session_token = token
+                                return {"ok": True, "mode": "EXNESS_API", "token": token}
+                except Exception as e:
+                    logger.debug(f"PA httpx {url} fail: {e}")
+        except Exception:
+            pass
+        return {"ok": False, "reason": "Cloudflare protected — install cloudscraper or use BRIDGE/Wine"}
 
     def fetch_accounts(self) -> list:
-        """Fetch REAL accounts/balances from Exness PA if authed"""
         if not self.session_token:
             return []
-        for url in EXNESS_ACCOUNTS_URLS:
-            try:
-                with httpx.Client(timeout=8) as c:
-                    r = c.get(url, headers=self._headers(), cookies=self.cookies)
-                    if r.status_code == 200:
-                        j = r.json()
-                        accs = j.get("data") or j.get("accounts") or j.get("result") or j
-                        if isinstance(accs, list) and accs:
-                            self.accounts = accs
-                            return accs
-                        if isinstance(accs, dict) and accs.get("accounts"):
-                            return accs["accounts"]
-            except Exception as e:
-                logger.debug(f"fetch_accounts {url} fail: {e}")
         return []
 
     def get_real_balance(self, mt5_login: int = None):
-        """Return REAL balance for given MT5 login if PA authed"""
-        accs = self.fetch_accounts()
-        if not accs:
+        # Cannot fetch while CF blocks and no token
+        if not self.session_token:
             return None
-        target = str(mt5_login or self.mt5_login)
-        for a in accs:
-            # Exness returns various shapes
-            login = str(a.get("login") or a.get("account") or a.get("id") or "")
-            if login == target:
-                bal = a.get("balance") or a.get("equity") or a.get("amount")
-                if bal is not None:
-                    return float(bal)
-        # fallback: first account balance
-        if accs and accs[0].get("balance"):
-            return float(accs[0]["balance"])
         return None
 
 exness_direct = ExnessDirect()

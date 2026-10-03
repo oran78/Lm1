@@ -102,7 +102,7 @@ export default function Page(){
   const flipPct=bot?.stats?.flip_progress??0; const equityCurve=bot?.stats?.equity_curve||[]; const markers=bot?.stats?.markers||[];
 
   const modeTone = mode==='NATIVE'?'emerald':mode==='BRIDGE'?'emerald':mode==='EXNESS_API'?'amber':mode==='REAL'?'amber':'neutral';
-  const modeLabel = mode==='NATIVE'?'NATIVE (Broker)':mode==='BRIDGE'?'BRIDGE (Windows)':mode==='EXNESS_API'?'EXNESS API':mode==='REAL'?'REAL Live Price':'—';
+  const modeLabel = mode==='NATIVE'?'NATIVE (Broker)':mode==='BRIDGE'?'BRIDGE (Windows)':mode==='EXNESS_API'?'EXNESS API (cloudscraper)':mode==='REAL'?'PAPER on LIVE (CF blocked)':'—';
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-zinc-100 selection:bg-amber-500/30">
@@ -189,7 +189,7 @@ export default function Page(){
             <span className="text-sm font-black text-red-300 animate-pulse">⚠️ REAL BALANCE NOT SYNCED — Enter your Exness balance:</span>
             <input value={balInput} onChange={e=>setBalInput(e.target.value)} placeholder="e.g. 10" className="w-28 bg-zinc-950 border border-red-900 rounded-full px-3 py-2 text-sm font-mono text-white placeholder:text-zinc-500 focus:border-red-500"/>
             <button onClick={async()=>{ try{ const r=await fetch(apiUrl('/api/balance/set'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({balance:parseFloat(balInput)})}); const j=await r.json(); if(!r.ok) throw new Error(j.detail); setMsg({t:'ok',m:j.message}); fetchAll(); }catch(e:any){ setMsg({t:'err',m:e.message}); } }} className="px-5 py-2 rounded-full bg-red-500 hover:bg-red-400 text-white font-black text-sm shadow-lg">Sync Balance →</button>
-            <span className="text-xs text-zinc-400">Chart = LIVE $4141 ✅ | For auto-sync use Exness PA <b>email</b> as login, or set <b>BRIDGE_URL</b> / Wine NATIVE for broker.</span>
+            <span className="text-xs text-zinc-400">Chart = LIVE $4141 ✅ | Exness PA is <b>Cloudflare blocked</b> on Railway — auto balance needs <b>BRIDGE_URL</b> (Windows) or <b>Wine</b>. Until then trades are PAPER on live price.</span>
           </div>
         )}
 

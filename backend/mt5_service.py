@@ -164,7 +164,7 @@ class MT5Service:
                         live = get_live_price_sync("XAUUSD") if HAS_MARKET else 4131.5
                         logger.info(f"EXNESS_DIRECT REAL mode for {login} — live ${live}")
                         # If password looks like MT5 master, we keep it for trade routing
-                        return {"status": "success", "message": f"🔗 Connected {login} @ {server} — XAU LIVE ${live:.2f}. REAL chart & signals. For auto REAL balance, use Exness Personal Area email as login, or deploy Wine NATIVE. Paper trades track LIVE price.", "mode": "REAL", "login": login, "server": server, "live_price": live}
+                        return {"status": "success", "message": f"🔗 Stored {login} @ {server} — XAU LIVE ${live:.2f} REAL. ⚠️ Railway Linux + Cloudflare blocks Exness balance — use Sync Balance (${live:.2f} chart), or BRIDGE_URL / Wine for auto broker balance. Paper on live price until then.", "mode": "REAL", "login": login, "server": server, "live_price": live, "paper": True}
             except Exception as e:
                 logger.warning(f"EXNESS_DIRECT fail {e}")
 
@@ -174,7 +174,7 @@ class MT5Service:
         self._connected = True
         self.mode = "REAL"
         live = get_live_price_sync("XAUUSD") if HAS_MARKET and get_live_price_sync else 4131.5
-        return {"status": "success", "message": f"🔗 Connected {login} @ {server} — XAU LIVE ${live:.2f} REAL. Chart & signals LIVE. Trades paper on live price until Exness API or Wine NATIVE. Tip: login with Exness PA email for auto balance.", "mode": "REAL", "login": login, "server": server, "live_price": live}
+        return {"status": "success", "message": f"🔗 Stored {login} @ {server} — XAU LIVE ${live:.2f} REAL. ⚠️ Exness PA blocked by Cloudflare on Railway — Sync your balance, or set BRIDGE_URL/Wine for broker. Paper on live price.", "mode": "REAL", "login": login, "server": server, "live_price": live, "paper": True}
 
     def set_balance(self, balance: float):
         self._real_balance = float(balance)
