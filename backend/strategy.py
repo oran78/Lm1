@@ -98,6 +98,37 @@ def _adx(candles, period=14):
     return max(0.0, min(100.0, adx)), pdi, mdi
 
 
+
+def _bollinger_bands(closes, period=20, mult=2.0):
+    """Bollinger Bands -> (upper, middle, lower)."""
+    if len(closes) < period:
+        return 0.0, 0.0, 0.0
+    recent = closes[-period:]
+    mid = sum(recent) / period
+    var = sum((x - mid) ** 2 for x in recent) / period
+    std = var ** 0.5
+    return mid + mult * std, mid, mid - mult * std
+
+
+def _stochastic(candles, k_period=5, d_period=3):
+    """Fast Stochastic Oscillator (5, 3) -> (K, D)."""
+    if len(candles) < k_period + d_period:
+        return 50.0, 50.0
+    k_vals = []
+    for i in range(len(candles) - d_period, len(candles)):
+        sub = candles[i - k_period + 1 : i + 1]
+        c = sub[-1]["close"]
+        lows = min(x["low"] for x in sub)
+        highs = max(x["high"] for x in sub)
+        if highs == lows:
+            k_vals.append(50.0)
+        else:
+            k_vals.append(((c - lows) / (highs - lows)) * 100.0)
+    k = k_vals[-1]
+    d = sum(k_vals) / len(k_vals)
+    return k, d
+
+
 def _session_ok(now=None):
     """London + New York liquidity window, 07:00-21:00 UTC, weekdays only."""
     now = now or datetime.now(timezone.utc)
@@ -231,6 +262,15 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
         return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
                 "reason": f"PLANNED {side} — target entry @ {ema9:.2f} (EMA9) • RSI {pb_rsi:.1f} • waiting for rejection close"}
 
+    # Compute Bollinger Bands & Stochastic
+    bb_upper, bb_mid, bb_lower = _bollinger_bands(closes, 20, 2.0)
+    stoch_k, stoch_d = _stochastic(data, 5, 3)
+    out["bb_upper"] = round(bb_upper, 2)
+    out["bb_mid"] = round(bb_mid, 2)
+    out["bb_lower"] = round(bb_lower, 2)
+    out["stoch_k"] = round(stoch_k, 1)
+    out["stoch_d"] = round(stoch_d, 1)
+
     # ---- trigger: spread gate
     sp_price = (spread or 0) / 100.0
     if spread and spread > max_spread_points:
@@ -238,9 +278,13 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     if sp_price > MAX_SPREAD_ATR * atr:
         return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {sp_price:.2f} > {MAX_SPREAD_ATR} × ATR {atr:.2f}"}
 
-    conf = int(min(95, 55 + 20 * min(1.0, gap / atr) + 20 * quality))
-    return {**out, "signal": side, "state": "TRIGGERED", "setup": "EMA_PULLBACK", "confidence": conf,
-            "reason": f"{side} ▶ EMA-zone rejection • RSI {pb_rsi:.1f} • ATR {atr:.2f} • spread {spread if spread is not None else '—'}"}
+    # Dual Confirmation Scoring: Trend Pullback + Stochastic Momentum Alignment
+    stoch_aligned = (side == "BUY" and stoch_k < 70) or (side == "SELL" and stoch_k > 30)
+    conf = int(min(98, 55 + 20 * min(1.0, gap / atr) + 15 * quality + (10 if stoch_aligned else 0)))
+    
+    setup_type = "EMA_PULLBACK"
+    return {**out, "signal": side, "state": "TRIGGERED", "setup": setup_type, "confidence": conf,
+            "reason": f"{side} ▶ Momentum Scalp (EMA Rejection + Stoch {stoch_k:.0f}) • RSI {pb_rsi:.1f} • ATR {atr:.2f}"}
 
 
 def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, tp_mult=1.8, min_rr=MIN_RR):
