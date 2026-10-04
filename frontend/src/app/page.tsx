@@ -75,6 +75,34 @@ export default function Page() {
   const [manualLot, setManualLot] = useState('0.01'); const [attachSlTp, setAttachSlTp] = useState(true); const [trading, setTrading] = useState(false);
   const hydrated = useRef(false);
 
+  // PIN lock
+  const [unlocked, setUnlocked] = useState<boolean | null>(null);
+  const [pinCode, setPinCode] = useState('');
+  const [pinError, setPinError] = useState(false);
+
+  useEffect(() => {
+    const saved = typeof window !== 'undefined' ? localStorage.getItem('kmoney_pin_unlocked') : null;
+    setUnlocked(saved === 'true');
+  }, []);
+
+  const handleUnlock = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (pinCode === '7890') {
+      localStorage.setItem('kmoney_pin_unlocked', 'true');
+      setUnlocked(true);
+      setPinError(false);
+      setPinCode('');
+    } else {
+      setPinError(true);
+      setPinCode('');
+    }
+  };
+
+  const handleLock = () => {
+    localStorage.removeItem('kmoney_pin_unlocked');
+    setUnlocked(false);
+  };
+
   const tick = ticks[symbol] || ticks.XAUUSD;
   const toast = useCallback((t: 'ok' | 'err', m: string) => { setMsg({ t, m }); }, []);
   useEffect(() => { if (!msg) return; const id = setTimeout(() => setMsg(null), 8000); return () => clearTimeout(id); }, [msg]);
@@ -206,6 +234,46 @@ export default function Page() {
   const risky = num(riskPct) > 2 || num(riskCap) > 25;
   const veryRisky = num(riskPct) > 10 || num(riskCap) > 40 || !dailyLossOn;
 
+  if (unlocked === null) {
+    return <div className="min-h-screen bg-[#07070b] flex items-center justify-center"><div className="h-8 w-8 animate-spin rounded-full border-2 border-amber-400 border-t-transparent" /></div>;
+  }
+
+  if (!unlocked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4 bg-[#07070b] relative selection:bg-amber-400/30">
+        <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(700px_420px_at_50%_40%,rgba(245,185,66,0.12),transparent_70%)]" />
+        <div className="card w-full max-w-sm p-8 text-center relative z-10 border border-white/10 shadow-2xl backdrop-blur-2xl bg-[#0d0d14]/90 rounded-3xl">
+          <div className="mx-auto mb-5 grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-br from-amber-300 via-amber-500 to-amber-600 text-2xl font-black text-zinc-950 shadow-xl shadow-amber-500/30">
+            K$
+          </div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">K <span className="gold-text">money</span></h1>
+          <p className="mt-1 text-xs text-zinc-400">XAUUSD Scalping Terminal</p>
+          <div className="my-6 h-px w-full bg-white/10" />
+          <form onSubmit={handleUnlock} className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-xs uppercase tracking-wider text-zinc-400 font-medium">Enter PIN</label>
+              <input
+                type="password"
+                maxLength={8}
+                inputMode="numeric"
+                autoFocus
+                placeholder="••••"
+                value={pinCode}
+                onChange={e => { setPinCode(e.target.value); setPinError(false); }}
+                className={`input text-center text-2xl tracking-[0.5em] font-mono !py-3 !rounded-2xl ${pinError ? '!border-rose-500 !bg-rose-500/10' : ''}`}
+              />
+              {pinError && <p className="text-xs text-rose-400 animate-pulse">Incorrect PIN. Try again.</p>}
+            </div>
+            <button type="submit" className="btn-gold w-full !py-3 !rounded-2xl text-sm font-semibold shadow-lg shadow-amber-500/20">
+              Unlock Terminal →
+            </button>
+          </form>
+          <p className="mt-6 text-[10px] text-zinc-500">Protected trading session</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen selection:bg-amber-400/30">
       <div className="pointer-events-none fixed inset-0 -z-10 bg-[radial-gradient(700px_420px_at_12%_-5%,rgba(245,185,66,0.10),transparent_60%),radial-gradient(700px_500px_at_100%_0%,rgba(120,90,255,0.10),transparent_60%)]" />
@@ -215,7 +283,7 @@ export default function Page() {
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-amber-300 to-amber-600 text-lg font-black text-zinc-950 shadow-lg shadow-amber-500/25">Au</div>
             <div className="leading-tight">
-              <h1 className="text-[17px] font-semibold tracking-tight">Klop <span className="gold-text">Apex</span></h1>
+              <h1 className="text-[17px] font-semibold tracking-tight">K <span className="gold-text">money</span></h1>
               <p className="label !text-[10px]">XAUUSD • Auto scalper</p>
             </div>
             <div className="ml-3 hidden items-center gap-2 md:flex">
@@ -229,6 +297,7 @@ export default function Page() {
             <div className="seg hidden sm:inline-flex">{SYMBOLS.map(s => <button key={s} data-on={symbol === s} onClick={() => setSymbol(s)}>{s}</button>)}</div>
             <select value={symbol} onChange={e => setSymbol(e.target.value)} className="input !w-auto !rounded-full !py-1.5 sm:hidden">{SYMBOLS.map(s => <option key={s}>{s}</option>)}</select>
             {connected ? <button onClick={disconnect} className="btn-ghost !px-4 !py-1.5 text-xs">Disconnect</button> : <button onClick={() => setShowConnect(v => !v)} className="btn-gold !px-4 !py-1.5 text-xs">Connect</button>}
+            <button onClick={handleLock} className="btn-ghost !px-3 !py-1.5 text-xs text-zinc-400 hover:text-white" title="Lock Dashboard">🔒 Lock</button>
           </div>
         </div>
       </header>
