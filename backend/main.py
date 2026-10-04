@@ -19,6 +19,7 @@ except Exception as e:
 from risk_engine import risk_engine
 from strategy import analyze_symbol
 import bot_engine
+from ownership import MANUAL_MAGIC, MANUAL_COMMENT
 
 logging.basicConfig(level=logging.INFO)
 logger=logging.getLogger("klop")
@@ -47,9 +48,13 @@ class BotPatch(BaseModel):
     symbol: Optional[str]=None; timeframe: Optional[str]=None; starting_balance: Optional[float]=None; session_filter: Optional[bool]=None
     max_hold_candles: Optional[int]=None; close_on_opposite: Optional[bool]=None; max_spread_points: Optional[float]=None
     be_enabled: Optional[bool]=None; be_trigger_r: Optional[float]=None; flip_mode: Optional[bool]=None
+    cooldown_candles_after_loss: Optional[int]=None; loss_streak_trigger: Optional[int]=None
+    loss_streak_cooldown_candles: Optional[int]=None; max_daily_loss_pct: Optional[float]=None
+    daily_loss_limit_enabled: Optional[bool]=None; risk_cap_pct: Optional[float]=None
+    htf_mode: Optional[str]=None; structure_mode: Optional[str]=None
 
 @app.get("/")
-def root(): return {"status":"ok","service":"Klop Apex","version":"2.5.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
+def root(): return {"status":"ok","service":"Klop Apex","version":"2.6.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/health")
 def health(): return {"status":"healthy","mt5": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/api/status")
@@ -142,15 +147,17 @@ def scalp_analysis(): return analysis("XAUUSD")
 @app.post("/api/trade")
 def trade(req: TradeRequest):
     if metaapi_service.is_connected():
-        allowed, reason=risk_engine.can_trade(req.volume, req.symbol)
+        allowed, reason=bot_engine.manual_trade_check(req.volume, req.symbol, req.action, req.sl)
         if not allowed: raise HTTPException(status_code=400, detail=f"Risk blocked: {reason}")
-        res=metaapi_service.send_order(symbol=req.symbol, action=req.action.upper(), volume=req.volume, sl=req.sl, tp=req.tp)
+        res=metaapi_service.send_order(symbol=req.symbol, action=req.action.upper(), volume=req.volume, sl=req.sl, tp=req.tp,
+                                       magic=MANUAL_MAGIC, comment=MANUAL_COMMENT)       # tagged: the auto-trader never touches it
         if res["status"]=="success": risk_engine.register_trade(req.volume)
         return res
     if not mt5_service.is_connected(): raise HTTPException(status_code=400, detail="Not connected")
-    allowed, reason=risk_engine.can_trade(req.volume, req.symbol)
+    allowed, reason=bot_engine.manual_trade_check(req.volume, req.symbol, req.action, req.sl)
     if not allowed: raise HTTPException(status_code=400, detail=f"Risk blocked: {reason}")
-    res=mt5_service.send_order(symbol=req.symbol, action=req.action.upper(), volume=req.volume, sl=req.sl, tp=req.tp)
+    res=mt5_service.send_order(symbol=req.symbol, action=req.action.upper(), volume=req.volume, sl=req.sl, tp=req.tp,
+                               magic=MANUAL_MAGIC, comment=MANUAL_COMMENT)
     if res["status"]=="success": risk_engine.register_trade(req.volume)
     return res
 @app.post("/api/close/{ticket}")

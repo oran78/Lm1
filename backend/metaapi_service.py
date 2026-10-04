@@ -264,7 +264,7 @@ class MetaApiService:
     def _trade_post(self, c, body, timeout=15):
         return c.post(self._acc_url(self._client_host(), "/trade"), headers=self._h(), json=body, timeout=timeout)
 
-    def send_order(self, symbol, action, volume, sl=None, tp=None):
+    def send_order(self, symbol, action, volume, sl=None, tp=None, magic=None, comment=None):
         bsym = self.resolve(symbol)
         if not bsym:
             return {"status": "error", "message": f"{symbol} not found in this MetaApi account's symbols (Market Watch). Available e.g.: {', '.join(self._broker_symbols[:8])}"}
@@ -274,6 +274,8 @@ class MetaApiService:
         is_buy = action.upper() == "BUY"
         body = {"symbol": bsym, "volume": vol, "actionType": "ORDER_TYPE_BUY" if is_buy else "ORDER_TYPE_SELL"}
         digits = int(spec.get("digits") or 2)
+        if magic is not None: body["magic"] = int(magic)           # ownership tag: the bot only manages its own magic
+        if comment: body["comment"] = str(comment)[:31]
         if sl and float(sl) > 0: body["stopLoss"] = round(float(sl), digits)
         if tp and float(tp) > 0: body["takeProfit"] = round(float(tp), digits)
         s_, t_ = body.get("stopLoss"), body.get("takeProfit")
@@ -328,7 +330,8 @@ class MetaApiService:
                          "type": "BUY" if "BUY" in str(p.get("type", "")).upper() else "SELL",
                          "volume": float(p.get("volume", 0)), "price_open": float(p.get("openPrice", 0)),
                          "price_current": float(p.get("currentPrice", 0)), "profit": float(p.get("profit", 0)),
-                         "sl": p.get("stopLoss"), "tp": p.get("takeProfit"), "time": p.get("time")} for p in arr]
+                         "sl": p.get("stopLoss"), "tp": p.get("takeProfit"), "time": p.get("time"),
+                         "magic": p.get("magic"), "comment": p.get("comment") or p.get("brokerComment")} for p in arr]
         except Exception as e:
             logger.warning(f"positions failed: {e}")
             raise            # the engine treats an exception as "unknown" and will not open blind trades
@@ -363,7 +366,9 @@ class MetaApiService:
                 deals = r.json()
                 deals = deals.get("deals", deals) if isinstance(deals, dict) else deals
                 out = [{"ticket": d.get("id"), "symbol": self.canonical(d.get("symbol")), "type": str(d.get("type", "")).replace("DEAL_TYPE_", ""),
-                        "volume": d.get("volume"), "profit": round(float(d.get("profit", 0) or 0), 2), "time": d.get("time")}
+                        "volume": d.get("volume"), "profit": round(float(d.get("profit", 0) or 0), 2), "time": d.get("time"),
+                        "position_id": d.get("positionId"), "commission": round(float(d.get("commission", 0) or 0), 2),
+                        "swap": round(float(d.get("swap", 0) or 0), 2)}
                        for d in deals if d.get("symbol") and str(d.get("entryType", "")).endswith("OUT")]
                 return out[-40:]
         except Exception as e:

@@ -68,8 +68,10 @@ export default function Page() {
 
   // bot form
   const [riskPct, setRiskPct] = useState('1'); const [targetMult, setTargetMult] = useState('2'); const [maxDay, setMaxDay] = useState('12');
-  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.0'); const [tpAtr, setTpAtr] = useState('1.5');
+  const [autoLot, setAutoLot] = useState(true); const [fixedLot, setFixedLot] = useState('0.01'); const [slAtr, setSlAtr] = useState('1.2'); const [tpAtr, setTpAtr] = useState('1.8');
   const [botTf, setBotTf] = useState<TF>('M5'); const [session, setSession] = useState(true); const [flipMode, setFlipMode] = useState(true);
+  const [htfMode, setHtfMode] = useState('counter'); const [structMode, setStructMode] = useState('counter');
+  const [riskCap, setRiskCap] = useState('20'); const [dailyLossOn, setDailyLossOn] = useState(true); const [dailyLossPct, setDailyLossPct] = useState('8');
   const [manualLot, setManualLot] = useState('0.01'); const [attachSlTp, setAttachSlTp] = useState(true); const [trading, setTrading] = useState(false);
   const hydrated = useRef(false);
 
@@ -84,6 +86,10 @@ export default function Page() {
     setRiskPct(String(c.risk_pct)); setTargetMult(String(c.target_multiplier)); setMaxDay(String(c.max_trades_per_day));
     setAutoLot(!!c.auto_lot); setFixedLot(String(c.fixed_lot)); setSlAtr(String(c.sl_atr_mult)); setTpAtr(String(c.tp_atr_mult));
     setBotTf((c.timeframe || 'M5') as TF); setTf((c.timeframe || 'M5') as TF); setSession(!!c.session_filter); if (c.flip_mode !== undefined) setFlipMode(!!c.flip_mode);
+    if (c.htf_mode) setHtfMode(String(c.htf_mode)); if (c.structure_mode) setStructMode(String(c.structure_mode));
+    if (c.risk_cap_pct !== undefined) setRiskCap(String(c.risk_cap_pct));
+    if (c.daily_loss_limit_enabled !== undefined) setDailyLossOn(!!c.daily_loss_limit_enabled);
+    if (c.max_daily_loss_pct !== undefined) setDailyLossPct(String(c.max_daily_loss_pct));
     if (c.symbol && SYMBOLS.includes(c.symbol)) setSymbol(c.symbol);
   };
 
@@ -155,9 +161,12 @@ export default function Page() {
   };
 
   const num = (v: string) => parseFloat(v);
-  const botBody = () => ({ risk_pct: num(riskPct), target_multiplier: num(targetMult), max_trades_per_day: parseInt(maxDay), auto_lot: autoLot, fixed_lot: num(fixedLot), sl_atr_mult: num(slAtr), tp_atr_mult: num(tpAtr), symbol, timeframe: botTf, session_filter: session, flip_mode: flipMode });
+  const botBody = () => ({ risk_pct: num(riskPct), target_multiplier: num(targetMult), max_trades_per_day: parseInt(maxDay), auto_lot: autoLot, fixed_lot: num(fixedLot), sl_atr_mult: num(slAtr), tp_atr_mult: num(tpAtr), symbol, timeframe: botTf, session_filter: session, flip_mode: flipMode, htf_mode: htfMode, structure_mode: structMode, risk_cap_pct: num(riskCap), daily_loss_limit_enabled: dailyLossOn, max_daily_loss_pct: num(dailyLossPct) });
   const validate = () => {
-    if (!(num(riskPct) > 0 && num(riskPct) <= 5)) return 'Risk per trade must be between 0.1% and 5%';
+    if (!(num(riskPct) >= 0.1 && num(riskPct) <= 25)) return 'Risk per trade must be between 0.1% and 25%';
+    if (!(num(riskCap) >= 0.5 && num(riskCap) <= 100)) return 'Max risk cap must be between 0.5% and 100%';
+    if (num(riskCap) < num(riskPct)) return 'Max risk cap must be at least as big as Risk / trade';
+    if (dailyLossOn && !(num(dailyLossPct) >= 0.5 && num(dailyLossPct) <= 100)) return 'Daily loss limit must be between 0.5% and 100%';
     if (!(num(slAtr) > 0 && num(tpAtr) > 0)) return 'SL / TP multipliers must be above 0';
     if (!autoLot && !(num(fixedLot) >= 0.01)) return 'Fixed lot must be at least 0.01';
     return null;
@@ -194,7 +203,8 @@ export default function Page() {
   const eq: number[] = (st?.equity_curve || []).map((p: any) => p.equity);
   const flip = st?.flip_progress ?? 0;
   const modeLabel = mode === 'METAAPI' ? 'MetaApi • Real broker' : mode === 'BRIDGE' ? 'Bridge' : mode === 'NATIVE' ? 'MT5 native' : mode === 'REAL' ? 'Paper on live price' : mode;
-  const risky = num(riskPct) > 2;
+  const risky = num(riskPct) > 2 || num(riskCap) > 25;
+  const veryRisky = num(riskPct) > 10 || num(riskCap) > 40 || !dailyLossOn;
 
   return (
     <div className="min-h-screen selection:bg-amber-400/30">
@@ -332,7 +342,7 @@ export default function Page() {
                 {!autoLot ? <label className="label">Fixed lot<input value={fixedLot} onChange={e => setFixedLot(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
                   : <label className="label flex items-end gap-2 pb-2.5 !normal-case !tracking-normal"><input type="checkbox" checked={session} onChange={e => setSession(e.target.checked)} className="h-4 w-4 accent-amber-400" /><span className="text-xs text-zinc-400">London + NY only</span></label>}
               </div>
-              {risky && <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">Risk above 2% per trade can wipe a small account quickly.</p>}
+              {risky && <p className={`mt-3 rounded-xl border px-3 py-2 text-xs ${veryRisky ? 'border-rose-400/25 bg-rose-400/10 text-rose-200' : 'border-amber-400/20 bg-amber-400/10 text-amber-200'}`}>{veryRisky ? 'High risk setup: a few losses in a row can wipe a small account.' : 'Risk above 2% per trade can wipe a small account quickly.'}</p>}
               <div className="mt-4 flex gap-2">
                 <button onClick={saveBot} className="btn-ghost flex-1">Save</button>
                 {!bot?.enabled ? <button onClick={startBot} disabled={!connected} className="btn-gold flex-1">▶ Start</button> : <button onClick={stopBot} className="btn-sell flex-1">⏹ Stop</button>}
@@ -340,11 +350,29 @@ export default function Page() {
               <div className="mt-3 flex items-center justify-between rounded-xl border border-amber-400/20 bg-amber-400/10 p-2.5">
                 <div>
                   <p className="text-xs font-semibold text-amber-300">$10 Flip Mode</p>
-                  <p className="text-[10px] text-zinc-400">Allows 0.01 lot on micro accounts (up to 35% risk cap)</p>
+                  <p className="text-[10px] text-zinc-400">Preset for micro accounts: sets the max risk cap to 20% (off = 10%). You can edit the cap below.</p>
                 </div>
-                <input type="checkbox" checked={flipMode} onChange={e => setFlipMode(e.target.checked)} className="h-4 w-4 accent-amber-400" />
+                <input type="checkbox" checked={flipMode} onChange={e => { setFlipMode(e.target.checked); setRiskCap(e.target.checked ? '20' : '10'); }} className="h-4 w-4 accent-amber-400" />
               </div>
-              <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">EMA 9/21 + RSI + ATR + ADX on closed candles • 1 position max • SL/TP on every order.</p>
+              <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                <p className="text-xs font-semibold text-zinc-200">Risk limits</p>
+                <div className="mt-2 grid grid-cols-2 gap-3">
+                  <label className="label">Max risk cap / trade %<input value={riskCap} onChange={e => setRiskCap(e.target.value)} inputMode="decimal" className="input mt-1.5 font-mono !normal-case !tracking-normal" /></label>
+                  <label className="label">Daily loss limit %<input value={dailyLossPct} onChange={e => setDailyLossPct(e.target.value)} disabled={!dailyLossOn} inputMode="decimal" className={`input mt-1.5 font-mono !normal-case !tracking-normal ${dailyLossOn ? '' : 'opacity-40'}`} /></label>
+                </div>
+                <label className="mt-2.5 flex items-center gap-2 !normal-case !tracking-normal"><input type="checkbox" checked={dailyLossOn} onChange={e => setDailyLossOn(e.target.checked)} className="h-4 w-4 accent-amber-400" /><span className="text-xs text-zinc-300">Daily loss limit {dailyLossOn ? 'ON — stops trading for the UTC day' : 'OFF — trades until Max / day or the flip target'}</span></label>
+                <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">The cap blocks a trade whose real risk is above it (e.g. 0.01 lot on a tiny account). Risk / trade % is what the bot aims for; the cap is the ceiling.</p>
+              </div>
+
+              <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                <p className="text-xs font-semibold text-zinc-200">Market context</p>
+                <div className="mt-2 grid grid-cols-2 gap-3">
+                  <label className="label">H1 trend filter<select value={htfMode} onChange={e => setHtfMode(e.target.value)} className="input mt-1.5 !normal-case !tracking-normal"><option value="off">Off</option><option value="counter">Counter (block against H1)</option><option value="strict">Strict (H1 must agree)</option></select></label>
+                  <label className="label">M5 structure<select value={structMode} onChange={e => setStructMode(e.target.value)} className="input mt-1.5 !normal-case !tracking-normal"><option value="off">Off</option><option value="counter">Counter (HH/HL vs LH/LL)</option><option value="strict">Strict (must agree)</option></select></label>
+                </div>
+                <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">Strict needs H1 candles from the broker; without them it will not trade (the Log tab says why). Counter only blocks trades that go against the bigger picture.</p>
+              </div>
+              <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">EMA 9/21/50 + RSI + Stoch + ATR on closed candles • 1 position max • SL/TP on every order.</p>
             </section>
 
             <section className="card-pad">

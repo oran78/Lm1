@@ -40,8 +40,10 @@ def fake_send(**kw):
                            "price_open": S["tick"]["ask"], "price_current": S["tick"]["ask"], "profit": 0.0, "sl": kw["sl"], "tp": kw["tp"], "time": 1_800_000_000 + trig_end * 300})
     return {"status": "success", "ticket": "501", "message": "ok"}
 be._any_send_order = fake_send
-be.bot_config.update(session_filter=False, enabled=True, risk_pct=1.0)
-ctx = {"last_candle": None, "tracked": {}, "be_retry": {}}
+be.bot_config.update(session_filter=False, enabled=True, risk_pct=1.0, htf_mode="off", structure_mode="off")
+S["history"] = []
+be._any_history = lambda days=2: S["history"]
+ctx = {"last_candle": None, "tracked": {}, "be_retry": {}, "risk": {}}
 run = lambda: asyncio.run(be._step(ctx))
 
 # 1) PLANNED_SETUP is published with the EMA9 target price and the side
@@ -72,7 +74,11 @@ at = be.get_bot_state()["active_trade"]; assert at["be_active"] and at["sl"] == 
 run(); run(); assert len(S["modify"]) == 1, "break-even repeated"
 print("auto break-even OK ->", S["modify"][0])
 
-# 4) position gone (SL/TP hit on the broker) -> active_trade cleared, P/L recorded
+# 4) position gone (SL/TP hit on the broker) -> active_trade cleared at once; P/L is booked from the broker's deal
 S["positions"].clear(); run()
-assert be.get_bot_state()["active_trade"] is None and be.bot_stats["wins"] + be.bot_stats["losses"] == 1
+assert be.get_bot_state()["active_trade"] is None
+assert be.bot_stats["wins"] + be.bot_stats["losses"] + be.bot_stats["breakevens"] == 0, "booked before the broker deal arrived"
+S["history"] = [{"ticket": "d77", "position_id": "501", "profit": 5.40, "commission": -0.20, "swap": 0.0}]
+run()
+assert be.bot_stats["wins"] == 1 and be.bot_stats["total_trades"] == 1 and abs(be.bot_stats["pnl_today"] - 5.20) < 1e-6, be.bot_stats
 print("CHART STATE TEST PASSED")

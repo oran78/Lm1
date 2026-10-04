@@ -1,20 +1,31 @@
 """
-Klop Apex — Momentum Pullback Scalper v2.5 (XAUUSD, M1/M5)
+Klop Apex — Momentum Pullback Scalper v2.6 (XAUUSD, M1/M5)
 
-Rules (all evaluated on CLOSED candles only — nothing repaints):
-  1. Trend bias   : EMA9 > EMA21 and EMA21 rising  -> BUY only
-                    EMA9 < EMA21 and EMA21 falling -> SELL only
+Rules (all evaluated on CLOSED candles only — nothing repaints). The constants below are the single
+source of truth; CHANGES.md only describes them.
+  0. Spike guard  : a closed candle with true range > 2.5 * ATR in the last 2 candles (news / stop-run)
+                    -> BLOCKED, no new entries until it ages out.
+  1a. H1 context  : (htf_mode) real H1 bias from market_context.htf_bias: BUY only when H1 is BULL, SELL only when BEAR
+                    ("strict"); "counter" only blocks trades AGAINST H1; "off" ignores H1.
+  1b. M5 structure: (structure_mode) HH+HL = BULL, LH+LL = BEAR from confirmed swings; "counter" blocks trades against it,
+                    "strict" requires it to agree, "off" ignores it.
+  1. Trend bias   : EMA9 > EMA21, EMA21 rising and close >= EMA50  -> BUY only
+                    EMA9 < EMA21, EMA21 falling and close <= EMA50 -> SELL only
                     |EMA9 - EMA21| < 0.3 * ATR     -> CHOP, no trading
-  2. Planned setup: with a bias, price pulls back into / toward the EMA9-EMA21 zone while RSI(14) cools
-                    to 42-58  ->  state PLANNED_SETUP, planned_entry_price = EMA9
+  2. Planned setup: with a bias, price pulls back into / toward the EMA9-EMA21 zone (within 0.75 ATR) while
+                    RSI(14) cools to 42-58 AND the CURRENT RSI has not run away (BUY <= 65, SELL >= 35)  ->  state PLANNED_SETUP. `planned_entry_price` = EMA9 is the
+                    PULLBACK ZONE shown on the chart; the actual entry is a market order on the trigger close.
   3. Trigger      : the closed candle touches the zone and closes with a rejection (bullish for BUY,
-                    bearish for SELL) back beyond EMA9  ->  signal BUY / SELL
+                    bearish for SELL) back beyond EMA9, AND Stochastic(5,3) confirms (BUY: K > D and K < 80,
+                    SELL: K < D and K > 20)  ->  signal BUY / SELL
                     Blocked if spread > 35 points or > 0.5 * ATR.
   4. Trade plan   : SL = 1.2 * ATR from entry (pushed past the pullback swing if needed, max 2 ATR), TP = 1.8 * ATR
                     (stretched to keep R:R >= 1.5),
                     break-even at +1R -> SL = entry +/- spread.   See plan_trade() / break_even_sl().
 """
 from datetime import datetime, timezone
+
+from market_context import market_structure
 
 
 def _ema_series(data, period):
@@ -99,17 +110,6 @@ def _adx(candles, period=14):
 
 
 
-def _bollinger_bands(closes, period=20, mult=2.0):
-    """Bollinger Bands -> (upper, middle, lower)."""
-    if len(closes) < period:
-        return 0.0, 0.0, 0.0
-    recent = closes[-period:]
-    mid = sum(recent) / period
-    var = sum((x - mid) ** 2 for x in recent) / period
-    std = var ** 0.5
-    return mid + mult * std, mid, mid - mult * std
-
-
 def _stochastic(candles, k_period=5, d_period=3):
     """Fast Stochastic Oscillator (5, 3) -> (K, D)."""
     if len(candles) < k_period + d_period:
@@ -141,16 +141,47 @@ def _session_ok(now=None):
 
 
 # ---------------------------------------------------------------------------------------------- tunables
-CHOP_ATR_FRAC = 0.25        # |EMA9-EMA21| below this fraction of ATR  => CHOP
+CHOP_ATR_FRAC = 0.30       # |EMA9-EMA21| below this fraction of ATR  => CHOP
 SLOPE_BARS = 3             # EMA21 angle is measured over this many closed candles
-RSI_BAND = (38.0, 62.0)    # Pro Scalper: flexible pullback band    # RSI must cool into this band during the pullback
+MACRO_EMA = 50             # BUY only above / SELL only below this EMA (higher-timeframe trend proxy)
+RSI_BAND = (42.0, 58.0)    # RSI must cool into this band during the pullback
 RSI_LOOKBACK = 3           # ...measured over the last N closed candles
-APPROACH_ATR = 0.85        # Pro Scalper: rapid approach zone        # price within this many ATR of the zone counts as "pulling back"
+APPROACH_ATR = 0.75        # price within this many ATR of the zone counts as "pulling back"
 SWING_BARS = 3             # swing window = pullback candle(s) + trigger candle
 MAX_SPREAD_ATR = 0.5       # spread veto relative to ATR
 MIN_RR = 1.5
 SWING_BUFFER_ATR = 0.1     # stop sits this far beyond the swing extreme
 MAX_SL_ATR = 2.0           # skip the trade if the stop would need to be wider than this many ATR
+SPIKE_ATR = 2.5            # a closed candle with true range above this many (pre-spike) ATR = news / stop-run
+SPIKE_LOOKBACK = 2         # ...blocks entries for this many closed candles
+STOCH_CONFIRM = True       # require Stochastic(5,3) to agree with the rejection candle
+STOCH_EXHAUST = (20.0, 80.0)   # BUY needs K < 80, SELL needs K > 20 (don't buy an exhausted move)
+
+
+RSI_NOW_LIMIT = (35.0, 65.0)   # current-candle RSI: BUY needs <= 65, SELL needs >= 35 (a cooled pullback that already ran away is not a pullback)
+STRUCT_N = 2                   # fractal width for M5 swings
+STRUCT_WINDOW = 80             # closed M5 candles used for structure
+STRUCT_MIN_MOVE_ATR = 0.1      # a "higher/lower" swing must differ by at least this many ATR
+CONTEXT_MODES = ("off", "counter", "strict")
+
+
+def rsi_ok(side, pb_rsi, rsi_now):
+    """Pullback RSI (lowest for BUY / highest for SELL over RSI_LOOKBACK candles) must sit in RSI_BAND, AND the current closed
+    candle's RSI must not be extended in the trade direction. Returns (ok, reason)."""
+    lo, hi = RSI_BAND
+    if not (lo <= pb_rsi <= hi):
+        return False, f"pullback RSI {pb_rsi:.1f} outside {lo:.0f}-{hi:.0f}"
+    nlo, nhi = RSI_NOW_LIMIT
+    if side == "BUY" and rsi_now > nhi:
+        return False, f"current RSI {rsi_now:.1f} > {nhi:.0f} — move already extended"
+    if side == "SELL" and rsi_now < nlo:
+        return False, f"current RSI {rsi_now:.1f} < {nlo:.0f} — move already extended"
+    return True, ""
+
+
+def _true_range(candles, i):
+    h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+    return max(h - l, abs(h - pc), abs(l - pc))
 
 
 def _rsi_cooled(closes, side):
@@ -177,7 +208,7 @@ def _rejection(side, c, e9):
 
 
 def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
-                   max_spread_points=35.0, now=None):
+                   max_spread_points=35.0, now=None, htf=None, htf_mode="off", structure_mode="off"):
     """
     candles : oldest -> newest. Last element is normally the still-forming candle (drop_forming=True).
     spread  : in points (price diff * 100), same unit the tick API returns.
@@ -185,6 +216,8 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     Returns a dict. `signal` is BUY / SELL / HOLD. `state` is one of:
       WARMUP, PAUSED, CHOP, NO_TREND, WATCH, PLANNED_SETUP, INVALIDATED, BLOCKED, TRIGGERED
     PLANNED_SETUP carries `planned_side` and `planned_entry_price` (= EMA9).
+    htf : dict from market_context.htf_bias() computed on CLOSED H1 candles (or None). htf_mode / structure_mode: off | counter | strict.
+          The library defaults are "off" (= the v2.6 behaviour); the bot passes its configured modes.
     """
     base = {"signal": "HOLD", "state": "WARMUP", "confidence": 0, "setup": None, "bias": None,
             "planned_side": None, "planned_entry_price": None,
@@ -217,11 +250,17 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
         return {**out, "state": "PAUSED", "reason": f"⏸ {session_label} — bot paused (London+NY only)"}
     if atr <= 0:
         return {**out, "state": "WARMUP", "reason": "ATR is zero — no volatility data"}
+    if SPIKE_LOOKBACK > 0 and len(data) > 14 + SPIKE_LOOKBACK:
+        base_atr = _atr(data[:-SPIKE_LOOKBACK], 14)           # ATR from BEFORE the suspect candles
+        spike = max(_true_range(data, len(data) - 1 - k) for k in range(SPIKE_LOOKBACK))
+        if base_atr > 0 and spike > SPIKE_ATR * base_atr:
+            return {**out, "state": "BLOCKED",
+                    "reason": f"⚠ Volatility spike — range {spike:.2f} > {SPIKE_ATR} × ATR {base_atr:.2f} (news?) • no entries for {SPIKE_LOOKBACK} candles"}
     if gap < CHOP_ATR_FRAC * atr:
         return {**out, "state": "CHOP", "reason": f"CHOP — EMA gap {gap:.2f} < {CHOP_ATR_FRAC} × ATR {atr:.2f} • no trade"}
 
-    # Pro Scalper Macro Trend Filter: compute EMA50 if enough candles
-    ema50 = _ema(closes, 50) if len(closes) >= 50 else None
+    # Macro trend filter: price must be on the trend side of EMA50 (when enough candles)
+    ema50 = _ema(closes, MACRO_EMA) if len(closes) >= MACRO_EMA else None
     out["ema50"] = round(ema50, 2) if ema50 else None
 
     if ema9 > ema21 and slope > 0:
@@ -235,6 +274,24 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     else:
         return {**out, "state": "NO_TREND", "reason": "EMAs aligned but EMA21 is not sloping with the trend — no bias"}
     out["bias"] = side
+
+    if htf_mode in ("counter", "strict"):
+        hb = (htf or {}).get("bias", "UNKNOWN")
+        out["htf_bias"] = hb
+        agrees = (hb == "BULL" and side == "BUY") or (hb == "BEAR" and side == "SELL")
+        opposes = (hb == "BEAR" and side == "BUY") or (hb == "BULL" and side == "SELL")
+        if hb == "UNKNOWN" and htf_mode == "strict":
+            return {**out, "state": "WARMUP", "reason": f"H1 context unavailable ({(htf or {}).get('reason', 'no H1 data')}) — set H1 filter to Off/Counter to trade without it"}
+        if opposes or (htf_mode == "strict" and not agrees):
+            return {**out, "state": "NO_TREND", "reason": f"M5 {side} setup but {(htf or {}).get('reason', 'H1 ' + hb)} — skipping"}
+
+    ms = market_structure(data[-STRUCT_WINDOW:], STRUCT_N, STRUCT_MIN_MOVE_ATR * atr)
+    out["m5_structure"] = ms["state"]
+    if structure_mode in ("counter", "strict"):
+        against = (ms["state"] == "BEAR" and side == "BUY") or (ms["state"] == "BULL" and side == "SELL")
+        agree_s = (ms["state"] == "BULL" and side == "BUY") or (ms["state"] == "BEAR" and side == "SELL")
+        if against or (structure_mode == "strict" and not agree_s):
+            return {**out, "state": "NO_TREND", "reason": f"M5 structure {ms['state']} does not support {side} — skipping"}
 
     zone_hi, zone_lo = max(ema9, ema21), min(ema9, ema21)
     if side == "BUY":
@@ -253,23 +310,24 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     out["pullback_rsi"] = round(pb_rsi, 1)
     if dist > APPROACH_ATR * atr:
         return {**out, "state": "WATCH", "reason": f"{side} bias — waiting for a pullback to the EMA zone ({dist:.2f} away)"}
-    if not (RSI_BAND[0] <= pb_rsi <= RSI_BAND[1]):
-        return {**out, "state": "WATCH",
-                "reason": f"{side} bias — pullback RSI {pb_rsi:.1f} outside {RSI_BAND[0]:.0f}-{RSI_BAND[1]:.0f}"}
+    rsi_pass, rsi_why = rsi_ok(side, pb_rsi, rsi)
+    if not rsi_pass:
+        return {**out, "state": "WATCH", "reason": f"{side} bias — {rsi_why}"}
 
     rejected, quality = _rejection(side, last, ema9) if touched else (False, 0.0)
     if not rejected:
         return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
-                "reason": f"PLANNED {side} — target entry @ {ema9:.2f} (EMA9) • RSI {pb_rsi:.1f} • waiting for rejection close"}
+                "reason": f"PLANNED {side} — pullback zone @ {ema9:.2f} (EMA9) • RSI {pb_rsi:.1f} • waiting for rejection close, then market entry"}
 
-    # Compute Bollinger Bands & Stochastic
-    bb_upper, bb_mid, bb_lower = _bollinger_bands(closes, 20, 2.0)
     stoch_k, stoch_d = _stochastic(data, 5, 3)
-    out["bb_upper"] = round(bb_upper, 2)
-    out["bb_mid"] = round(bb_mid, 2)
-    out["bb_lower"] = round(bb_lower, 2)
     out["stoch_k"] = round(stoch_k, 1)
     out["stoch_d"] = round(stoch_d, 1)
+    if STOCH_CONFIRM:
+        lo, hi = STOCH_EXHAUST
+        stoch_ok = (stoch_k > stoch_d and stoch_k < hi) if side == "BUY" else (stoch_k < stoch_d and stoch_k > lo)
+        if not stoch_ok:
+            return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
+                    "reason": f"{side} rejection seen but Stochastic not confirming (K {stoch_k:.0f} / D {stoch_d:.0f}) — no entry"}
 
     # ---- trigger: spread gate
     sp_price = (spread or 0) / 100.0
@@ -278,13 +336,24 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     if sp_price > MAX_SPREAD_ATR * atr:
         return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {sp_price:.2f} > {MAX_SPREAD_ATR} × ATR {atr:.2f}"}
 
-    # Dual Confirmation Scoring: Trend Pullback + Stochastic Momentum Alignment
-    stoch_aligned = (side == "BUY" and stoch_k < 70) or (side == "SELL" and stoch_k > 30)
-    conf = int(min(98, 55 + 20 * min(1.0, gap / atr) + 15 * quality + (10 if stoch_aligned else 0)))
-    
+    conf = int(min(98, 60 + 25 * min(1.0, gap / atr) + 15 * quality))
     setup_type = "EMA_PULLBACK"
+
+    # explainability: why this trade exists (information only — the gates above already decided)
+    swept = (ms["last_low"] is not None and last["low"] < ms["last_low"] < last["close"]) if side == "BUY" else \
+            (ms["last_high"] is not None and last["high"] > ms["last_high"] > last["close"])
+    reasons = []
+    if htf_mode != "off":
+        reasons.append(f"H1 {out.get('htf_bias', 'n/a')}")
+    reasons += [f"M5 structure {ms['state']}", "EMA9/21 pullback", f"{'bullish' if side == 'BUY' else 'bearish'} rejection",
+                f"RSI {pb_rsi:.0f}→{rsi:.0f}"]
+    if STOCH_CONFIRM:
+        reasons.append(f"Stoch {stoch_k:.0f}/{stoch_d:.0f}")
+    if swept:
+        reasons.append("liquidity sweep")
+    out["reasons"] = reasons
     return {**out, "signal": side, "state": "TRIGGERED", "setup": setup_type, "confidence": conf,
-            "reason": f"{side} ▶ Momentum Scalp (EMA Rejection + Stoch {stoch_k:.0f}) • RSI {pb_rsi:.1f} • ATR {atr:.2f}"}
+            "reason": f"{side} ▶ Momentum Scalp (EMA Rejection + Stoch {stoch_k:.0f}) • RSI {pb_rsi:.1f} • ATR {atr:.2f} • why: {'; '.join(reasons)}"}
 
 
 def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, tp_mult=1.8, min_rr=MIN_RR):
@@ -312,8 +381,7 @@ def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, t
 
 def break_even_sl(side, entry, sl, bid, ask, trigger_r=1.0, lock_buffer=False):
     """
-    Pro Scalper Auto Break-Even.
-    Triggers when floating profit >= trigger_r * initial risk (default 0.8R).
+    Auto break-even. Triggers when floating profit >= trigger_r * initial risk (default 1.0R).
     BUY -> entry + spread (+ optional micro buffer), SELL -> entry - spread.
     """
     if not sl or not entry:

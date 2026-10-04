@@ -22,7 +22,7 @@ app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_
 class Conn(BaseModel):
     login:int; password:str; server:str
 class Order(BaseModel):
-    symbol:str; action:str; volume:float; sl:float|None=None; tp:float|None=None
+    symbol:str; action:str; volume:float; sl:float|None=None; tp:float|None=None; magic:int=202501; comment:str="Klop Apex"
 @app.get("/health")
 def health(): return {"status":"ok","mt5":HAS_MT5}
 @app.get("/")
@@ -59,7 +59,7 @@ def br_positions():
     if not HAS_MT5: return {"positions":[]}
     pos=mt5.positions_get()
     if not pos: return {"positions":[]}
-    return {"positions":[{"ticket":p.ticket,"symbol":p.symbol,"type":"BUY" if p.type==0 else "SELL","volume":p.volume,"price_open":p.price_open,"price_current":p.price_current,"profit":p.profit,"sl":p.sl,"tp":p.tp,"time":int(p.time)} for p in pos]}
+    return {"positions":[{"ticket":p.ticket,"symbol":p.symbol,"type":"BUY" if p.type==0 else "SELL","volume":p.volume,"price_open":p.price_open,"price_current":p.price_current,"profit":p.profit,"sl":p.sl,"tp":p.tp,"time":int(p.time),"magic":p.magic,"comment":p.comment} for p in pos]}
 @app.post("/bridge/order")
 def br_order(o:Order):
     if not HAS_MT5: return {"status":"error","message":"no mt5"}
@@ -67,7 +67,7 @@ def br_order(o:Order):
     if not tick: return {"status":"error","message":f"No tick {o.symbol}"}
     typ=mt5.ORDER_TYPE_BUY if o.action=="BUY" else mt5.ORDER_TYPE_SELL
     price=tick.ask if o.action=="BUY" else tick.bid
-    req={"action":mt5.TRADE_ACTION_DEAL,"symbol":o.symbol,"volume":o.volume,"type":typ,"price":price,"deviation":30,"magic":202501,"type_filling":mt5.ORDER_FILLING_IOC}
+    req={"action":mt5.TRADE_ACTION_DEAL,"symbol":o.symbol,"volume":o.volume,"type":typ,"price":price,"deviation":30,"magic":o.magic,"comment":o.comment[:31],"type_filling":mt5.ORDER_FILLING_IOC}
     if o.sl: req["sl"]=o.sl
     if o.tp: req["tp"]=o.tp
     r=mt5.order_send(req)
@@ -84,7 +84,7 @@ def br_close(ticket:int):
     tick=mt5.symbol_info_tick(p.symbol)
     ctyp=mt5.ORDER_TYPE_SELL if p.type==0 else mt5.ORDER_TYPE_BUY
     price=tick.bid if p.type==0 else tick.ask
-    req={"action":mt5.TRADE_ACTION_DEAL,"symbol":p.symbol,"volume":p.volume,"type":ctyp,"position":ticket,"price":price,"deviation":30,"magic":202501,"type_filling":mt5.ORDER_FILLING_IOC}
+    req={"action":mt5.TRADE_ACTION_DEAL,"symbol":p.symbol,"volume":p.volume,"type":ctyp,"position":ticket,"price":price,"deviation":30,"magic":p.magic,"type_filling":mt5.ORDER_FILLING_IOC}
     r=mt5.order_send(req)
     if r and r.retcode in (mt5.TRADE_RETCODE_DONE,10009): return {"status":"success","message":f"Closed {ticket}"}
     return {"status":"error","message":f"Close fail {r.comment if r else mt5.last_error()}"}

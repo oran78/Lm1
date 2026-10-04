@@ -57,8 +57,9 @@ print("trend / chop / planned / trigger rules OK")
 
 # no repaint: the forming (last) candle must not change a decision on closed candles
 end,r0=trig[0]
-a=analyze_symbol(cs[:end]+[dict(cs[end],close=cs[end]["close"]+9)],spread=30,now=NOW,session_filter=False)
-b=analyze_symbol(cs[:end]+[dict(cs[end],close=cs[end]["close"]-9)],spread=30,now=NOW,session_filter=False)
+# (the forming candle is cs[end-1] here: analyze_symbol(cs[:end]) drops it and decides on cs[:end-1])
+a=analyze_symbol(cs[:end-1]+[dict(cs[end-1],close=cs[end-1]["close"]+9)],spread=30,now=NOW,session_filter=False)
+b=analyze_symbol(cs[:end-1]+[dict(cs[end-1],close=cs[end-1]["close"]-9)],spread=30,now=NOW,session_filter=False)
 assert a["signal"]==b["signal"]==r0["signal"] and a["candle_time"]==b["candle_time"]; print("no-repaint OK")
 
 # session filter

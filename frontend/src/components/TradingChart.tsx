@@ -23,13 +23,13 @@ export default function TradingChart({ data, markers, resetKey, height = 420, pl
   const fittedFor = useRef<string | undefined>(undefined);
   latest.current = { data, markers, resetKey, planned, trade };
 
-  /** amber dashed TARGET ENTRY line + TP / SL / break-even lines, rebuilt only when something actually changed */
+  /** amber dashed PULLBACK ZONE (EMA9) line + TP / SL / break-even lines, rebuilt only when something actually changed */
   const pushLines = () => {
     const series = seriesRef.current;
     if (!series) return;
     const { planned: pl, trade: tr } = latest.current;
     const want: Line[] = [];
-    if (pl) want.push({ price: pl.price, color: '#fbbf24', title: `TARGET ENTRY @ ${fmt(pl.price)}`, style: DASHED, width: 2 });
+    if (pl) want.push({ price: pl.price, color: '#fbbf24', title: `PULLBACK ZONE (EMA9) @ ${fmt(pl.price)}`, style: DASHED, width: 2 });
     if (tr) {
       if (tr.tp !== null) want.push({ price: tr.tp, color: '#34d399', title: `TP @ ${fmt(tr.tp)}`, style: SOLID, width: 2 });
       if (tr.sl !== null) {

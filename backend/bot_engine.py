@@ -1,4 +1,14 @@
 """
+Klop Apex — Auto Flip Engine v2.6 (momentum pullback scalper)
+
+v2.6: * ONE parameter set (config defaults == strategy.py == CHANGES.md): SL 1.2 / TP 1.8 ATR, BE at 1R.
+      * Real P/L: closed trades are priced from the broker's deal history (floating P/L only as a fallback).
+      * Scratch trades (break-even exits) are counted separately, not as wins -> honest win rate.
+      * total_trades counted once (on close). First pass after start/restart never trades a stale candle.
+      * Loss handling: short cooldown after a loss, a longer one after a losing streak. The bot never stops
+        for the day by itself: it keeps looking for entries until max_trades_per_day or the target is hit
+        (the only other stop is the optional daily-loss cap, `max_daily_loss_pct`, 0 = off).
+
 Klop Apex — Auto Flip Engine v2.5 (momentum pullback scalper)
 
 v2.5: strategy is the EMA-zone pullback scalper (see strategy.py). The engine publishes
@@ -29,6 +39,8 @@ except Exception:
     _HAS_METAAPI_BOT = False
     _metaapi_bot = None
 from risk_engine import risk_engine
+from ownership import BOT_MAGIC, BOT_COMMENT, MANUAL_MAGIC, MANUAL_COMMENT, split_positions
+from market_context import htf_bias
 from strategy import analyze_symbol, plan_trade, break_even_sl
 
 logger = logging.getLogger("klop.bot")
@@ -74,6 +86,25 @@ def _any_positions(sym):
         return None   # None = unknown (do NOT open new trades blind)
     return [p for p in (ps or []) if str(p.get("symbol", "")).upper() == sym.upper()]
 
+def _any_history(days=2):
+    try:
+        return (_metaapi_bot.get_history(days) if _meta_on() else mt5_service.get_history(days)) or []
+    except Exception:
+        return None
+
+def _realized_pnl(ticket, _fallback=None):
+    """Net P/L (profit + commission + swap) of a closed position from the broker's deals, or None if not (yet) there."""
+    deals = _any_history(2)
+    if not deals:
+        return None
+    tot, found = 0.0, False
+    for d in deals:
+        key = d.get("position_id") if d.get("position_id") not in (None, "") else d.get("ticket")
+        if str(key) == str(ticket):
+            found = True
+            tot += float(d.get("profit") or 0) + float(d.get("commission") or 0) + float(d.get("swap") or 0)
+    return round(tot, 2) if found else None
+
 def _any_close(ticket):
     return _metaapi_bot.close_position(ticket) if _meta_on() else mt5_service.close_position(ticket)
 
@@ -106,19 +137,28 @@ bot_config = {
     "max_trades_per_day": 12,
     "auto_lot": True,
     "fixed_lot": 0.01,
-    "sl_atr_mult": 1.0,            # SL distance = 1.2 x ATR
-    "tp_atr_mult": 1.5,            # TP distance = 1.8 x ATR  -> R:R 1.5
+    "sl_atr_mult": 1.2,            # SL distance = 1.2 x ATR (pushed beyond the pullback swing when further away)
+    "tp_atr_mult": 1.8,            # TP distance = 1.8 x ATR  -> R:R 1.5
     "timeframe": "M5",
     "session_filter": True,
     "max_hold_candles": 12,        # time-stop: close a trade that goes nowhere after N candles
     "close_on_opposite": True,
     "max_spread_points": 35,       # absolute spread cap (points = price*100); strategy also caps at 0.5 x ATR
     "be_enabled": True,            # auto break-even
-    "be_trigger_r": 0.8,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
+    "be_trigger_r": 1.0,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
+    "cooldown_candles_after_loss": 2,   # skip this many candles after a loss (don't re-enter the same chop)
+    "loss_streak_trigger": 3,           # N losses in a row -> take the longer break below (0 = off); trading then resumes
+    "loss_streak_cooldown_candles": 6,  # ...skip this many candles (M5: 30 min) so the bot waits for a different market
+    "htf_mode": "counter",              # H1 bias filter: off | counter (block only trades AGAINST H1) | strict (H1 must agree; no H1 data = no trade)
+    "structure_mode": "counter",        # M5 HH/HL-LH/LL filter: off | counter | strict
+    "daily_loss_limit_enabled": True,   # switch for the daily-loss stop below (off = trade until max/day or target)
+    "max_daily_loss_pct": 8.0,          # stop for the UTC day once today's P/L <= -X% of balance
+    "risk_cap_pct": 20.0,               # per-trade ceiling: a trade whose real risk (min lot on a small account) exceeds this is blocked
 }
 
 bot_stats = {
-    "trades_today": 0, "wins": 0, "losses": 0, "pnl_today": 0.0, "total_trades": 0,
+    "trades_today": 0, "wins": 0, "losses": 0, "breakevens": 0, "pnl_today": 0.0, "total_trades": 0,
+    "consec_losses": 0, "cooldown_until": 0.0, "day_start_balance": None,
     "equity_curve": deque(maxlen=300), "log": deque(maxlen=100), "markers": deque(maxlen=120),
     "last_signal": "HOLD", "last_state": "WARMUP", "last_reason": "", "flip_progress": 0.0,
     "planned_setup": None,         # {"side","entry_price","symbol","timeframe","candle_time","as_of"} or None
@@ -137,14 +177,35 @@ def _log(msg, typ="info"):
 def _reset_daily_if_needed():
     today = datetime.now(timezone.utc).date().isoformat()
     if bot_stats["today_start"] != today:
-        bot_stats.update(today_start=today, trades_today=0, pnl_today=0.0, wins=0, losses=0)
+        bot_stats.update(today_start=today, trades_today=0, pnl_today=0.0, wins=0, losses=0, breakevens=0,
+                         consec_losses=0, cooldown_until=0.0, day_start_balance=None)
+        risk_engine.day_start_balance = None
         _log(f"New day {today} — counters reset", "info")
 
-def record_close(pnl: float):
+BE_BAND = 0.15   # |P/L| below 15% of the initial risk = scratch (break-even exit), neither a win nor a loss
+
+def record_close(pnl: float, risk: float = None):
+    """Book a closed trade. `risk` = money risked at entry (None if unknown, e.g. after a restart). Returns WIN/LOSS/BE."""
     bot_stats["pnl_today"] += pnl
     bot_stats["total_trades"] += 1
-    if pnl >= 0: bot_stats["wins"] += 1
-    else: bot_stats["losses"] += 1
+    scratch = (abs(pnl) < BE_BAND * risk) if risk else (pnl == 0)
+    if scratch:
+        bot_stats["breakevens"] += 1
+        return "BE"
+    if pnl > 0:
+        bot_stats["wins"] += 1
+        bot_stats["consec_losses"] = 0
+        return "WIN"
+    bot_stats["losses"] += 1
+    bot_stats["consec_losses"] += 1
+    tf_secs = _TF_SECS.get(bot_config["timeframe"], 300)
+    n = bot_config["cooldown_candles_after_loss"]
+    trig = bot_config["loss_streak_trigger"]
+    if trig and bot_stats["consec_losses"] >= trig:
+        n = max(n, bot_config["loss_streak_cooldown_candles"])
+        _log(f"{bot_stats['consec_losses']} losses in a row — taking a {n}-candle break, then searching again", "warn")
+    bot_stats["cooldown_until"] = time.time() + n * tf_secs
+    return "LOSS"
 
 def get_bot_state():
     acc = _any_account()
@@ -159,6 +220,8 @@ def get_bot_state():
             "planned_setup": bot_stats["planned_setup"], "active_trade": bot_stats["active_trade"],
             "stats": {
         "trades_today": bot_stats["trades_today"], "wins": bot_stats["wins"], "losses": bot_stats["losses"],
+        "breakevens": bot_stats["breakevens"], "consec_losses": bot_stats["consec_losses"],
+        "day_start_balance": bot_stats["day_start_balance"],
         "pnl_today": round(bot_stats["pnl_today"], 2), "total_trades": bot_stats["total_trades"], "win_rate": wr,
         "equity_curve": list(bot_stats["equity_curve"])[-60:], "log": list(bot_stats["log"])[-40:],
         "markers": list(bot_stats["markers"])[-40:], "last_signal": bot_stats["last_signal"],
@@ -166,12 +229,37 @@ def get_bot_state():
         "last_reason": bot_stats["last_reason"], "flip_progress": bot_stats["flip_progress"],
         "target_balance": round(tgt, 2), "starting_balance": round(start, 2), "current_balance": round(bal, 2)}}
 
+def _sync_risk():
+    """Push the user's risk settings into the risk engine (with sane bounds)."""
+    bot_config["risk_pct"] = min(max(float(bot_config["risk_pct"] or 1.0), 0.05), 50.0)
+    bot_config["risk_cap_pct"] = min(max(float(bot_config["risk_cap_pct"] or 10.0), 0.5), 100.0)
+    bot_config["max_daily_loss_pct"] = min(max(float(bot_config["max_daily_loss_pct"] or 0.0), 0.0), 100.0)
+    risk_engine.max_risk_pct_hard = bot_config["risk_cap_pct"]
+    risk_engine.max_daily_loss_pct = bot_config["max_daily_loss_pct"] if bot_config["daily_loss_limit_enabled"] else 0.0
+
+def manual_trade_check(volume: float, symbol: str, action: str, sl=None):
+    """Same safety gates as an automated entry, for POST /api/trade: lot bounds, hourly limit, daily-loss limit (from the fixed
+    day-start balance), per-trade risk cap (when an SL is attached), margin. Returns (ok, reason). Fails closed without account data."""
+    acc = _any_account()
+    if not acc or float(acc.get("balance") or 0) <= 0:
+        return False, "account info unavailable — cannot verify risk"
+    _sync_risk()
+    tick = _any_tick(symbol) or {}
+    price = tick.get("ask") if str(action).upper() == "BUY" else tick.get("bid")
+    sl_dist = abs(float(price) - float(sl)) if (price and sl) else None
+    return risk_engine.can_trade(volume, symbol, balance=float(acc["balance"]), sl_dist=sl_dist, price=price,
+                                 leverage=int(acc.get("leverage") or 2000), pnl_today=bot_stats["pnl_today"])
+
+
 def update_config(patch: dict):
     for k, v in patch.items():
+        if k in ("htf_mode", "structure_mode") and v not in ("off", "counter", "strict"):
+            continue                                   # ignore unknown modes instead of silently disabling the filter
         if k in bot_config and k != "enabled":
             bot_config[k] = v
     if "flip_mode" in patch:
-        risk_engine.flip_mode = bool(patch["flip_mode"])
+        risk_engine.flip_mode = bool(patch["flip_mode"])     # kept for the API; the cap itself is `risk_cap_pct`
+    _sync_risk()
     if "target_multiplier" in patch or "starting_balance" in patch:
         sb = bot_config["starting_balance"]
         if sb: bot_config["target_balance"] = round(sb * bot_config["target_multiplier"], 2)
@@ -212,12 +300,30 @@ def _ensure_marker(p):
 
 
 # ------------------------------------------------------------------ main loop
+async def _get_htf(ctx, symbol, now_t):
+    """H1 bias from CLOSED H1 candles, refreshed at most every 2 minutes. None when the H1 filter is off."""
+    if bot_config["htf_mode"] == "off":
+        return None
+    cached = ctx.get("htf")
+    if cached and now_t - cached["at"] < 120:
+        return cached["bias"]
+    try:
+        h1, _src = await asyncio.to_thread(_any_candles, symbol, "H1", 160)
+        bias = htf_bias(list(h1[:-1]) if h1 else [])        # drop the still-forming H1 candle
+    except Exception as e:
+        bias = {"bias": "UNKNOWN", "reason": f"H1 fetch failed: {e}"}
+    ctx["htf"] = {"at": now_t, "bias": bias}
+    return bias
+
+
 async def _step(ctx):
     """One pass of the bot. Returns the number of seconds to sleep before the next pass."""
     _reset_daily_if_needed()
     symbol = bot_config["symbol"]
     tf_secs = _TF_SECS.get(bot_config["timeframe"], 300)
     tracked = ctx["tracked"]
+    ctx.setdefault("risk", {})
+    ctx.setdefault("owned", set())
 
     if not await asyncio.to_thread(_is_any_connected):
         _log("Not connected — waiting for broker", "warn"); return 5
@@ -225,20 +331,34 @@ async def _step(ctx):
     acc = await asyncio.to_thread(_any_account)
     if acc:
         bot_stats["equity_curve"].append({"t": int(time.time()), "equity": acc["equity"], "balance": acc["balance"]})
+        if bot_stats["day_start_balance"] is None and acc.get("balance", 0) > 0:
+            bot_stats["day_start_balance"] = float(acc["balance"])      # the daily-loss limit is measured from this, all day
+        risk_engine.day_start_balance = bot_stats["day_start_balance"]
 
     # ---- 1. sync open positions; record P/L of anything that closed (broker SL/TP, manual, etc.)
     positions = await asyncio.to_thread(_any_positions, symbol)
     if positions is None:
         return 5                                   # unknown state: never act blind
     now_t = time.time()
-    current = {p["ticket"]: p for p in positions}
+    owned, unknown = split_positions(positions, ctx["owned"])       # only OUR positions are counted / managed / closed
+    current = {p["ticket"]: p for p in owned}
+    if unknown and not ctx.get("warned_unknown"):
+        ctx["warned_unknown"] = True
+        _log(f"{len(unknown)} position(s) on {symbol} carry no ownership tag — not touching them and not opening next to them", "warn")
     for t, info in list(tracked.items()):
-        if t not in current:
-            record_close(info["profit"])
-            _log(f"Position {t} closed — P/L ${info['profit']:.2f}", "success" if info["profit"] >= 0 else "warn")
-            del tracked[t]
+        if t in current:
+            continue
+        pnl = await asyncio.to_thread(_realized_pnl, t)
+        src = "broker"
+        if pnl is None:
+            if now_t - info.setdefault("gone_at", now_t) < 20:
+                continue                           # broker history can lag a few seconds — retry next pass
+            pnl, src = info["profit"], "est. from last floating P/L"
+        kind = record_close(pnl, info.get("risk"))
+        _log(f"Position {t} closed — {kind} P/L ${pnl:.2f} ({src})", "success" if pnl > 0 else "warn")
+        del tracked[t]
     for t, p in current.items():
-        tracked.setdefault(t, {"first_seen": now_t, "profit": 0.0})["profit"] = float(p.get("profit") or 0)
+        tracked.setdefault(t, {"first_seen": now_t, "profit": 0.0, "risk": ctx["risk"].get(str(t))})["profit"] = float(p.get("profit") or 0)
         _ensure_marker(p)
 
     tick = await asyncio.to_thread(_any_tick, symbol)
@@ -271,8 +391,10 @@ async def _step(ctx):
         return 10
 
     spread = tick.get("spread", 0) or 0
+    htf = await _get_htf(ctx, symbol, now_t)
     result = analyze_symbol(candles, spread=spread, session_filter=bot_config["session_filter"],
-                            max_spread_points=bot_config["max_spread_points"])
+                            max_spread_points=bot_config["max_spread_points"], htf=htf,
+                            htf_mode=bot_config["htf_mode"], structure_mode=bot_config["structure_mode"])
     result["data_source"] = source
     sig = result["signal"]
     bot_stats["last_signal"] = sig
@@ -280,7 +402,12 @@ async def _step(ctx):
     bot_stats["last_reason"] = result.get("reason", "")
     _publish_setup(result, symbol, bool(current))
 
-    new_candle = result.get("candle_time") is not None and result["candle_time"] != ctx["last_candle"]
+    ct = result.get("candle_time")
+    if ctx["last_candle"] is None and ct is not None:
+        ctx["last_candle"] = ct                    # first pass after start/restart: that candle is already old — wait for the next close
+        new_candle = False
+    else:
+        new_candle = ct is not None and ct != ctx["last_candle"]
 
     # ---- 4. manage open trades (opposite signal / time-stop; SL/TP/BE live on the broker)
     for t, p in list(current.items()):
@@ -293,8 +420,7 @@ async def _step(ctx):
             r = await asyncio.to_thread(_any_close, t)
             _log(f"Close {t} ({why}): {r.get('message')}", "info" if r.get("status") == "success" else "error")
             if r.get("status") == "success":
-                record_close(float(r.get("profit", tracked[t]["profit"])))
-                tracked.pop(t, None); current.pop(t, None)
+                current.pop(t, None)               # P/L is booked by step 1 once the broker reports the deal
     if not current and bot_stats["active_trade"]:
         bot_stats["active_trade"] = None
 
@@ -306,8 +432,12 @@ async def _step(ctx):
 
     if current:
         _log(f"{sig} signal skipped — position already open", "info"); return 2
+    if unknown:
+        _log(f"{sig} skipped — untagged position(s) on {symbol}; cannot tell whether they are the bot's", "warn"); return 4
     if bot_stats["trades_today"] >= bot_config["max_trades_per_day"]:
         _log("Max trades/day reached", "warn"); return 10
+    if now_t < bot_stats["cooldown_until"]:
+        _log(f"{sig} skipped — cooling down after a loss ({int(bot_stats['cooldown_until'] - now_t)}s left)", "info"); return 4
 
     acc = await asyncio.to_thread(_any_account)
     balance = float(acc["balance"]) if acc else 0.0
@@ -325,6 +455,10 @@ async def _step(ctx):
     else:
         lot = float(bot_config["fixed_lot"]); risk_money = lot * risk_engine.contract_size * sl_dist
 
+    eff_pct = risk_money / balance * 100.0 if balance > 0 else 0.0
+    if eff_pct > bot_config["risk_pct"] * 2:
+        _log(f"⚠ min lot {lot} forces {eff_pct:.1f}% risk (setting is {bot_config['risk_pct']}%)", "warn")
+
     ok, why = risk_engine.can_trade(lot, symbol, balance=balance, sl_dist=sl_dist, price=entry,
                                     leverage=leverage, pnl_today=bot_stats["pnl_today"])
     if not ok:
@@ -332,11 +466,14 @@ async def _step(ctx):
 
     _log(f"{sig} [{result.get('setup')}] @ {entry:.2f} lot {lot} risk ${risk_money:.2f} "
          f"SL {sl:.2f} TP {tp:.2f} (R:R {plan['rr']}) • ATR {atr:.2f} RSI {result['rsi']} ({result['confidence']}%)", "info")
-    order = await asyncio.to_thread(lambda: _any_send_order(symbol=symbol, action=sig, volume=lot, sl=sl, tp=tp))
+    order = await asyncio.to_thread(lambda: _any_send_order(symbol=symbol, action=sig, volume=lot, sl=sl, tp=tp,
+                                                            magic=BOT_MAGIC, comment=BOT_COMMENT))
     if order.get("status") != "success":
         _log(f"Order failed: {order.get('message')}", "error"); return 6
 
-    bot_stats["trades_today"] += 1; bot_stats["total_trades"] += 1; risk_engine.register_trade(lot)
+    bot_stats["trades_today"] += 1; risk_engine.register_trade(lot)
+    ctx["risk"][str(order.get("ticket"))] = risk_money
+    ctx["owned"].add(str(order.get("ticket")))
     bot_stats["planned_setup"] = None                # trade triggered -> planned line disappears
     bot_stats["markers"].append({"time": int(time.time()), "price": entry, "type": sig, "lot": lot,
                                  "ticket": str(order.get("ticket")), "setup": result.get("setup")})
@@ -350,8 +487,8 @@ async def _step(ctx):
 
 
 async def _loop():
-    _log("Pullback Scalper v2.5 started — EMA-zone rejection, 1 position max, auto break-even", "success")
-    ctx = {"last_candle": None, "tracked": {}, "be_retry": {}}
+    _log("Pullback Scalper v2.6 started — EMA-zone rejection, 1 position max, auto break-even", "success")
+    ctx = {"last_candle": None, "tracked": {}, "be_retry": {}, "risk": {}, "owned": set()}
     while bot_config["enabled"]:
         delay = 4
         try:
@@ -377,6 +514,7 @@ def start_bot():
         bot_config["starting_balance"] = 10.0
         bot_config["target_balance"] = round(10 * bot_config["target_multiplier"], 2)
     _reset_daily_if_needed()
+    _sync_risk()
     bot_config["enabled"] = True
     try:
         _task = asyncio.get_running_loop().create_task(_loop())

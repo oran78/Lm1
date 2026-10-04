@@ -35,7 +35,7 @@ async def fast_sleep(s,*a,**k):
     vt[0]+=s; await real_sleep(0)
 asyncio.sleep=fast_sleep
 
-be.bot_config.update(session_filter=False, risk_pct=1.0, target_multiplier=1000, max_trades_per_day=50)
+be.bot_config.update(session_filter=False, risk_pct=1.0, target_multiplier=1000, max_trades_per_day=50, htf_mode="off", structure_mode="off")
 be.risk_engine.max_trades_per_hour=50
 
 opened=[]; open_hist=[]

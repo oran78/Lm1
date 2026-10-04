@@ -16,13 +16,14 @@ from collections import deque
 class RiskEngine:
     def __init__(self):
         self.max_daily_loss_pct = 8.0
+        self.day_start_balance = None  # fixed for the UTC day (set by the bot engine); the daily-loss limit is measured against it
         self.flip_mode = False
         self.min_lot = 0.01
         self.max_lot = 0.20
         self.lot_step = 0.01
         self.contract_size = 100.0     # XAUUSD: 100 oz per 1.00 lot
         self.max_trades_per_hour = 12
-        self.max_risk_pct_hard = 10.0  # absolute per-trade ceiling even when min-lot forces more risk
+        self.max_risk_pct_hard = 10.0  # per-trade ceiling: a trade whose (min-lot forced) risk is above this is BLOCKED
         self.max_margin_use_pct = 50.0 # margin for the new trade must stay under 50% of balance
         self._trades = deque(maxlen=50)
 
@@ -49,12 +50,14 @@ class RiskEngine:
         if balance is not None:
             if balance <= 0:
                 return False, "Balance is 0 — connect broker or Sync Balance first"
-            if pnl_today <= -balance * self.max_daily_loss_pct / 100.0:
-                return False, f"Daily loss limit {self.max_daily_loss_pct}% hit — trading paused until tomorrow"
+            ref = self.day_start_balance or balance          # NOT the shrinking current balance
+            if self.max_daily_loss_pct > 0 and pnl_today <= -ref * self.max_daily_loss_pct / 100.0:
+                return False, (f"Daily loss limit {self.max_daily_loss_pct}% of day-start balance ${ref:.2f} hit "
+                               f"(P/L today ${pnl_today:.2f}) — trading paused until tomorrow")
             if sl_dist:
                 risk_money = volume * self.contract_size * sl_dist
                 risk_pct = risk_money / balance * 100.0
-                effective_cap = 35.0 if self.flip_mode else self.max_risk_pct_hard
+                effective_cap = self.max_risk_pct_hard      # one explicit, user-editable number (bot setting `risk_cap_pct`)
                 if risk_pct > effective_cap:
                     return False, (f"Account too small: min lot {volume} with SL ${sl_dist:.2f} risks "
                                    f"${risk_money:.2f} = {risk_pct:.0f}% of balance (cap {self.max_risk_pct_hard:.0f}%)")

@@ -349,7 +349,7 @@ class MT5Service:
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
             try:
                 pos=mt5.positions_get()
-                if pos is not None: return [{"ticket": p.ticket, "symbol": p.symbol, "type": "BUY" if p.type==0 else "SELL", "volume": p.volume, "price_open": p.price_open, "price_current": p.price_current, "profit": p.profit, "sl": p.sl, "tp": p.tp, "time": int(p.time)} for p in pos]
+                if pos is not None: return [{"ticket": p.ticket, "symbol": p.symbol, "type": "BUY" if p.type==0 else "SELL", "volume": p.volume, "price_open": p.price_open, "price_current": p.price_current, "profit": p.profit, "sl": p.sl, "tp": p.tp, "time": int(p.time), "magic": p.magic, "comment": p.comment} for p in pos]
             except: pass
         self._paper_check_exits()
         return list(_mock_positions)
@@ -360,14 +360,16 @@ class MT5Service:
                 from datetime import datetime, timedelta
                 frm=datetime.now()-timedelta(days=days)
                 deals=mt5.history_deals_get(frm, datetime.now())
-                if deals is not None: return [{"ticket": d.ticket, "symbol": d.symbol, "type": d.type, "volume": d.volume, "profit": d.profit, "time": int(d.time)} for d in deals[-30:]]
+                if deals is not None: return [{"ticket": d.ticket, "symbol": d.symbol, "type": d.type, "volume": d.volume, "profit": d.profit, "time": int(d.time), "position_id": d.position_id, "commission": d.commission, "swap": d.swap} for d in deals[-60:]]
             except: pass
         return list(_mock_history)
 
-    def send_order(self, symbol: str, action: str, volume: float, sl=None, tp=None):
+    def send_order(self, symbol: str, action: str, volume: float, sl=None, tp=None, magic=None, comment=None):
         sym=symbol.upper()
+        magic_n=int(magic) if magic is not None else 202501
+        comment_s=(str(comment) if comment else "Klop Apex")[:31]
         if _get_bridge_url() or BRIDGE_URL:
-            j=self._bridge_request("/bridge/order", "POST", {"symbol":sym,"action":action,"volume":volume,"sl":sl,"tp":tp})
+            j=self._bridge_request("/bridge/order", "POST", {"symbol":sym,"action":action,"volume":volume,"sl":sl,"tp":tp,"magic":magic_n,"comment":comment_s})
             if j and j.get("status")=="success": return {"status":"success","message":f"✅ LIVE BRIDGE {action} {volume} {sym} (REAL broker)","ticket":j.get("ticket"),"mode":"BRIDGE"}
             if j and j.get("status")=="error": return j
         if HAS_MT5 and self.mode=="NATIVE" and mt5 is not None:
@@ -376,7 +378,7 @@ class MT5Service:
                 if not tick: return {"status": "error", "message": f"No tick for {sym}"}
                 order_type=mt5.ORDER_TYPE_BUY if action=="BUY" else mt5.ORDER_TYPE_SELL
                 price=tick.ask if action=="BUY" else tick.bid
-                req={"action": mt5.TRADE_ACTION_DEAL, "symbol": sym, "volume": float(volume), "type": order_type, "price": price, "deviation": 30, "magic": 202501, "comment": "Klop Apex", "type_filling": mt5.ORDER_FILLING_IOC}
+                req={"action": mt5.TRADE_ACTION_DEAL, "symbol": sym, "volume": float(volume), "type": order_type, "price": price, "deviation": 30, "magic": magic_n, "comment": comment_s, "type_filling": mt5.ORDER_FILLING_IOC}
                 if sl: req["sl"]=float(sl)
                 if tp: req["tp"]=float(tp)
                 res=mt5.order_send(req)
@@ -391,7 +393,8 @@ class MT5Service:
             if action=="BUY" and not (sl<entry<tp): return {"status":"error","message":f"Invalid SL/TP for BUY @ {entry}"}
             if action=="SELL" and not (tp<entry<sl): return {"status":"error","message":f"Invalid SL/TP for SELL @ {entry}"}
         _paper_ticket[0]+=1
-        pos={"ticket": _paper_ticket[0], "symbol": sym, "type": action, "volume": float(volume), "price_open": entry, "price_current": entry, "profit": 0.0, "sl": sl or 0, "tp": tp or 0, "time": int(time.time())}
+        pos={"ticket": _paper_ticket[0], "symbol": sym, "type": action, "volume": float(volume), "price_open": entry, "price_current": entry, "profit": 0.0, "sl": sl or 0, "tp": tp or 0, "time": int(time.time()),
+             "magic": magic_n, "comment": comment_s}
         _mock_positions.append(pos)
         return {"status": "success", "message": f"📝 PAPER {action} {volume} {sym} @ {entry} (simulated — no broker connected)", "ticket": pos["ticket"], "mode": self.mode}
 
@@ -454,7 +457,7 @@ class MT5Service:
                 tick=mt5.symbol_info_tick(p.symbol)
                 close_type=mt5.ORDER_TYPE_SELL if p.type==0 else mt5.ORDER_TYPE_BUY
                 price=tick.bid if p.type==0 else tick.ask
-                req={"action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": p.volume, "type": close_type, "position": ticket, "price": price, "deviation": 30, "magic": 202501, "type_filling": mt5.ORDER_FILLING_IOC}
+                req={"action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": p.volume, "type": close_type, "position": ticket, "price": price, "deviation": 30, "magic": getattr(p, "magic", 202501), "type_filling": mt5.ORDER_FILLING_IOC}
                 res=mt5.order_send(req)
                 if res and res.retcode in (mt5.TRADE_RETCODE_DONE, 10009): return {"status": "success", "message": f"Closed LIVE {ticket} on broker"}
                 return {"status": "error", "message": f"Close fail: {res.comment if res else mt5.last_error()}"}
