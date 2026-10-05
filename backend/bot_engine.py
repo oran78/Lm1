@@ -462,7 +462,32 @@ async def _step(ctx):
     ok, why = risk_engine.can_trade(lot, symbol, balance=balance, sl_dist=sl_dist, price=entry,
                                     leverage=leverage, pnl_today=bot_stats["pnl_today"])
     if not ok:
-        _log(f"Risk blocked {sig} {lot}: {why}", "warn"); return 6
+        # SMALL-ACCOUNT FIX: 0.01 lot on gold (100 oz/lot) often risks more than the cap on a small
+        # balance, so a valid signal dies on a wide swing-based stop. Before giving up, retry with a
+        # progressively TIGHTER stop (down to 0.35 x ATR) and stretch TP to hold the R:R. A tight stop
+        # is exactly what a scalper wants anyway — this makes the bot actually trade instead of idling.
+        _log(f"{sig} risk-blocked ({why}) — retrying with a tighter stop to fit the account...", "info")
+        lowered = bot_config["sl_atr_mult"]
+        while lowered > 0.35:
+            lowered = round(max(0.30, lowered - 0.15), 4)
+            tplan, twhy = plan_trade(sig, entry, atr, result.get("swing_low"), result.get("swing_high"),
+                                     lowered, bot_config["tp_atr_mult"])
+            if not tplan:
+                continue
+            tlot = lot
+            tsl_dist = tplan["risk"]
+            tok, twhy2 = risk_engine.can_trade(tlot, symbol, balance=balance, sl_dist=tsl_dist,
+                                               price=entry, leverage=leverage, pnl_today=bot_stats["pnl_today"])
+            if tok:
+                lot, sl_dist, sl, tp = tlot, tsl_dist, tplan["sl"], tplan["tp"]
+                plan = tplan  # keep the log's R:R / SL / TP in sync with the tightened stop
+                ok, why = True, "tighter stop"
+                risk_money = tlot * risk_engine.contract_size * tsl_dist
+                _log(f"Adjusted stop for small account: SL×{lowered:.2f} → SL {sl:.2f} TP {tp:.2f} "
+                     f"(risk ${risk_money:.2f} = {risk_money/balance*100:.1f}%)", "success")
+                break
+        if not ok:
+            _log(f"Risk blocked {sig} {lot}: {why}", "warn"); return 6
 
     _log(f"{sig} [{result.get('setup')}] @ {entry:.2f} lot {lot} risk ${risk_money:.2f} "
          f"SL {sl:.2f} TP {tp:.2f} (R:R {plan['rr']}) • ATR {atr:.2f} RSI {result['rsi']} ({result['confidence']}%)", "info")
