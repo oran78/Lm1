@@ -384,10 +384,14 @@ async def _step(ctx):
     # ---- 3. analysis on CLOSED candles
     candles, source = await asyncio.to_thread(_any_candles, symbol, bot_config["timeframe"], 95)
     if not candles or len(candles) < 32:
-        bot_stats["last_reason"] = f"Warming up candles ({len(candles or [])}/32) source={source}"
+        err = getattr(_metaapi_bot, '_last_candle_err', None) if _HAS_METAAPI_BOT else None
+        bot_stats["last_reason"] = (f"Warming up candles ({len(candles or [])}/32) source={source}" +
+                                     (f" — {err}" if err else ""))
         bot_stats["planned_setup"] = None
         return 10
     if source == "none":
+        err = getattr(_metaapi_bot, '_last_candle_err', None) if _HAS_METAAPI_BOT else None
+        bot_stats["last_reason"] = f"No candle source (all feeds empty)" + (f" — {err}" if err else "")
         return 10
 
     spread = tick.get("spread", 0) or 0

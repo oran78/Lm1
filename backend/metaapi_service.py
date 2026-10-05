@@ -237,12 +237,35 @@ class MetaApiService:
         bsym = self.resolve(symbol)
         if not bsym: return []
         tf = _TF.get(timeframe, "5m")
+        # cooldown failed candles briefly to avoid hammering a 504ing account
+        if self._last_candle_err and time.time() - getattr(self, '_last_candle_fail_at', 0) < 10:
+            # still in cooldown — return empty quickly (caller falls back to PAXG)
+            return []
         try:
-            with httpx.Client(timeout=15) as c:
+            with httpx.Client(timeout=20) as c:
                 r = c.get(self._acc_url(self._market_host(), f"/historical-market-data/symbols/{bsym}/timeframes/{tf}/candles"),
                           headers=self._h(), params={"limit": min(int(count), 1000)})
                 if r.status_code != 200:
-                    self._last_candle_err = f"HTTP {r.status_code}: {r.text[:120]}"
+                    body = r.text[:300] if hasattr(r, 'text') else ''
+                    # 504 TimeoutError from MetaApi almost always means the account is not CONNECTED/DEPLOYED
+                    if r.status_code == 504 or 'TimeoutError' in body:
+                        self._last_candle_err = f"MetaApi 504 Timeout — account {self.account_id[:8]}… is not CONNECTED on MetaApi. Open app.metaapi.cloud → your account → press Deploy/Enable and wait until it shows CONNECTED, then press ↻ Re-check. Raw: {body[:120]}"
+                        self._last_candle_fail_at = time.time()
+                        logger.warning(f"candles {bsym} {tf} 504 TimeoutError — account not connected, not retrying market host for 10s")
+                        # try to refresh region/provisioning once (region may have moved)
+                        try:
+                            prov = self._provision(c)
+                            if prov.status_code == 200:
+                                j = prov.json()
+                                new_region = j.get('region')
+                                if new_region and new_region != self._region:
+                                    self._region = new_region
+                                    logger.info(f"MetaApi region refreshed to {self._region} after 504")
+                        except Exception:
+                            pass
+                        return []
+                    self._last_candle_err = f"HTTP {r.status_code}: {body[:120]}"
+                    self._last_candle_fail_at = time.time()
                     logger.warning(f"candles {bsym} {tf} {self._last_candle_err}")
                     return []
                 out = []
@@ -254,9 +277,11 @@ class MetaApiService:
                 out.sort(key=lambda x: x["time"])
                 out = out[-count:]
                 self._last_candle_ok = time.time(); self._last_candle_count = len(out); self._last_candle_err = None
+                self._last_candle_fail_at = 0
                 return out
         except Exception as e:
             self._last_candle_err = str(e)
+            self._last_candle_fail_at = time.time()
             logger.warning(f"candles error: {e}")
             return []
 
@@ -384,13 +409,20 @@ class MetaApiService:
         from strategy import _session_ok
         sess_ok, sess_label = _session_ok()
         tf_secs = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}.get(timeframe, 300)
-        market_open = bool(tick) and (age is None or age < tf_secs * 4)
+        # If MetaApi candles are 0 but tick is live, market is open but DATA is missing — don't show green.
+        # age==None means no candles at all, so NOT fresh.
+        if not candles:
+            market_open = False
+            fresh_label = "Market open / candles fresh — no broker candles (fallback will be used if available)"
+        else:
+            market_open = bool(tick) and age is not None and age < tf_secs * 4
+            fresh_label = "Market open / candles fresh" + (f" ({int(age)}s ago)" if age is not None else "")
         checks = [
             {"key": "account", "label": "MetaApi account connected", "ok": self._connected},
             {"key": "symbol", "label": f"Gold symbol found ({bsym})" if bsym else "Gold symbol found in broker list", "ok": bool(bsym)},
             {"key": "tick", "label": "Live bid/ask streaming" + (f" ({tick['bid']:.2f}/{tick['ask']:.2f})" if tick else ""), "ok": bool(tick)},
             {"key": "candles", "label": f"{timeframe} history loaded ({len(candles)}/45+)", "ok": len(candles) >= 45},
-            {"key": "fresh", "label": "Market open / candles fresh", "ok": market_open},
+            {"key": "fresh", "label": fresh_label, "ok": market_open if candles else False},
             {"key": "session", "label": f"Trading session — {sess_label}", "ok": sess_ok},
         ]
         return {"connected": self._connected, "symbol": "XAUUSD", "broker_symbol": bsym, "tick": tick, "candles": len(candles),
