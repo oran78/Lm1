@@ -146,9 +146,9 @@ bot_config = {
     "max_spread_points": 35,       # absolute spread cap (points = price*100); strategy also caps at 0.5 x ATR
     "be_enabled": True,            # auto break-even
     "be_trigger_r": 1.0,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
-    "cooldown_candles_after_loss": 2,   # skip this many candles after a loss (don't re-enter the same chop)
+    "cooldown_candles_after_loss": 1,   # skip this many candles after a loss (was 2 — re-enter faster)
     "loss_streak_trigger": 3,           # N losses in a row -> take the longer break below (0 = off); trading then resumes
-    "loss_streak_cooldown_candles": 6,  # ...skip this many candles (M5: 30 min) so the bot waits for a different market
+    "loss_streak_cooldown_candles": 4,  # ...skip this many candles (was 6 — M5: ~20 min, rebounded sooner)
     "htf_mode": "counter",              # H1 bias filter: off | counter (block only trades AGAINST H1) | strict (H1 must agree; no H1 data = no trade)
     "structure_mode": "counter",        # M5 HH/HL-LH/LL filter: off | counter | strict
     "daily_loss_limit_enabled": True,   # switch for the daily-loss stop below (off = trade until max/day or target)
@@ -382,9 +382,9 @@ async def _step(ctx):
     _publish_trade(list(current.values()))
 
     # ---- 3. analysis on CLOSED candles
-    candles, source = await asyncio.to_thread(_any_candles, symbol, bot_config["timeframe"], 120)
-    if not candles or len(candles) < 45:
-        bot_stats["last_reason"] = f"Warming up candles ({len(candles or [])}/45) source={source}"
+    candles, source = await asyncio.to_thread(_any_candles, symbol, bot_config["timeframe"], 95)
+    if not candles or len(candles) < 32:
+        bot_stats["last_reason"] = f"Warming up candles ({len(candles or [])}/32) source={source}"
         bot_stats["planned_setup"] = None
         return 10
     if source == "none":

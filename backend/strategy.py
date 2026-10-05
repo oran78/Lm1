@@ -141,12 +141,12 @@ def _session_ok(now=None):
 
 
 # ---------------------------------------------------------------------------------------------- tunables
-CHOP_ATR_FRAC = 0.30       # |EMA9-EMA21| below this fraction of ATR  => CHOP
+CHOP_ATR_FRAC = 0.18       # |EMA9-EMA21| below this fraction of ATR  => CHOP  (was 0.30 — looser, so weak trends still trade)
 SLOPE_BARS = 3             # EMA21 angle is measured over this many closed candles
 MACRO_EMA = 50             # BUY only above / SELL only below this EMA (higher-timeframe trend proxy)
-RSI_BAND = (42.0, 58.0)    # RSI must cool into this band during the pullback
+RSI_BAND = (36.0, 64.0)    # RSI must cool into this band during the pullback  (was 42-58 — easier to enter)
 RSI_LOOKBACK = 3           # ...measured over the last N closed candles
-APPROACH_ATR = 0.75        # price within this many ATR of the zone counts as "pulling back"
+APPROACH_ATR = 1.20        # price within this many ATR of the zone counts as "pulling back"  (was 0.75 — fires from further out)
 SWING_BARS = 3             # swing window = pullback candle(s) + trigger candle
 MAX_SPREAD_ATR = 0.5       # spread veto relative to ATR
 MIN_RR = 1.5
@@ -158,7 +158,7 @@ STOCH_CONFIRM = True       # require Stochastic(5,3) to agree with the rejection
 STOCH_EXHAUST = (20.0, 80.0)   # BUY needs K < 80, SELL needs K > 20 (don't buy an exhausted move)
 
 
-RSI_NOW_LIMIT = (35.0, 65.0)   # current-candle RSI: BUY needs <= 65, SELL needs >= 35 (a cooled pullback that already ran away is not a pullback)
+RSI_NOW_LIMIT = (30.0, 70.0)   # current-candle RSI: BUY needs <= 70, SELL needs >= 30 (was 35-65)
 STRUCT_N = 2                   # fractal width for M5 swings
 STRUCT_WINDOW = 80             # closed M5 candles used for structure
 STRUCT_MIN_MOVE_ATR = 0.1      # a "higher/lower" swing must differ by at least this many ATR
@@ -224,8 +224,8 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
             "adx": 0, "atr": 0, "rsi": 50, "pdi": 0, "mdi": 0, "candle_time": None, "spread": spread,
             "swing_low": None, "swing_high": None}
     data = candles[:-1] if (drop_forming and candles) else list(candles or [])
-    if len(data) < 40:
-        return {**base, "reason": f"Loading candles ({len(data)}/40 closed)…"}
+    if len(data) < 30:
+        return {**base, "reason": f"Loading candles ({len(data)}/30 closed)…"}
 
     closes = [c["close"] for c in data]
     last = data[-1]
