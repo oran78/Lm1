@@ -1,3 +1,31 @@
+# Klop Apex v2.8 — "signal found but no trade" fixed
+
+## Why valid setups never became trades (verified by running the real loop on a $10 paper account)
+1. **The small-account "tighter stop" retry did nothing.** `plan_trade` always pushes the stop beyond the pullback swing, so lowering
+   `sl_atr_mult` from 1.2 to 0.30 left the stop at the swing distance (e.g. $4.30 -> 43% of a $10 balance) and the trade stayed
+   `Account too small`. New `fit_plan_to_account()` shrinks the stop *inside* the swing (steps of 0.1 ATR, never below `min_sl_atr_mult`
+   and never below 3 x live spread) and keeps TP at the configured R:R (>= 1.5) relative to the tighter stop.
+2. **Daily-loss limit (8%) was smaller than the per-trade risk (19-24%)** on micro accounts, so ONE normal loss paused the bot for the day.
+   Defaults are now coherent: `risk_cap_pct` 25, `max_daily_loss_pct` 30 (dashboard refuses a daily limit <= the cap).
+3. **Every block burned the candle.** Any gate (account hiccup, broker order error) consumed the signal for that candle and nothing retried.
+   Now a candle is only spent on a final decision (trade opened / real rule blocked it); account and broker errors are retried up to 3 times
+   inside the same candle (the "position already open" check stays first on every pass, so a retry cannot double-open).
+
+## Visibility
+* `stats.last_block` = `{time, signal, reason}` for the last TRIGGERED signal that was not traded; shown on the dashboard (amber box). Cleared when a trade opens.
+* Log lines now read `BUY NOT opened — <reason>`.
+
+## New dashboard settings (Risk limits box) — defaults in bold
+* Small-account fit on/off (**on**), Min stop x ATR (**0.5**). Max risk cap **25%** (was 20), daily loss limit **30%** (was 8).
+* Strategy rules and entry timing (rejection candle close + Stochastic) are unchanged: the amber PLANNED SETUP line is a plan, not a signal.
+
+## Tests
+* `tests/test_fit.py` (sizing), `tests/test_micro_account.py` (real loop on $10), existing engine/strategy/chart/metaapi tests pass.
+* `test_v26.py` / `test_v27.py` already failed before this change (they assert old strategy constants) and were not touched.
+* Frontend was syntax-checked, not built (`npm install && npm run build` on your side).
+
+---
+
 # Klop Apex v2.7 — ownership, fixed daily-loss reference, real H1 context
 
 ## Safety fixes (verified against the code first)

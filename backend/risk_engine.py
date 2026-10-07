@@ -12,10 +12,12 @@ Now:
 import time
 from collections import deque
 
+RISK_CAP_PREFIX = "Account too small"   # prefix of the can_trade() reason when the per-trade risk cap is what blocks a trade
+
 
 class RiskEngine:
     def __init__(self):
-        self.max_daily_loss_pct = 8.0
+        self.max_daily_loss_pct = 30.0
         self.day_start_balance = None  # fixed for the UTC day (set by the bot engine); the daily-loss limit is measured against it
         self.flip_mode = False
         self.min_lot = 0.01
@@ -23,7 +25,7 @@ class RiskEngine:
         self.lot_step = 0.01
         self.contract_size = 100.0     # XAUUSD: 100 oz per 1.00 lot
         self.max_trades_per_hour = 12
-        self.max_risk_pct_hard = 10.0  # per-trade ceiling: a trade whose (min-lot forced) risk is above this is BLOCKED
+        self.max_risk_pct_hard = 25.0  # per-trade ceiling: a trade whose (min-lot forced) risk is above this is BLOCKED
         self.max_margin_use_pct = 50.0 # margin for the new trade must stay under 50% of balance
         self._trades = deque(maxlen=50)
 
@@ -59,7 +61,7 @@ class RiskEngine:
                 risk_pct = risk_money / balance * 100.0
                 effective_cap = self.max_risk_pct_hard      # one explicit, user-editable number (bot setting `risk_cap_pct`)
                 if risk_pct > effective_cap:
-                    return False, (f"Account too small: min lot {volume} with SL ${sl_dist:.2f} risks "
+                    return False, (f"{RISK_CAP_PREFIX}: min lot {volume} with SL ${sl_dist:.2f} risks "
                                    f"${risk_money:.2f} = {risk_pct:.0f}% of balance (cap {self.max_risk_pct_hard:.0f}%)")
             if price:
                 margin = volume * self.contract_size * price / max(leverage, 1)

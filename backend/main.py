@@ -52,9 +52,10 @@ class BotPatch(BaseModel):
     loss_streak_cooldown_candles: Optional[int]=None; max_daily_loss_pct: Optional[float]=None
     daily_loss_limit_enabled: Optional[bool]=None; risk_cap_pct: Optional[float]=None
     htf_mode: Optional[str]=None; structure_mode: Optional[str]=None
+    tight_stop_fallback: Optional[bool]=None; min_sl_atr_mult: Optional[float]=None
 
 @app.get("/")
-def root(): return {"status":"ok","service":"Klop Apex","version":"2.6.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
+def root(): return {"status":"ok","service":"Klop Apex","version":"2.8.0","mt5_connected": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/health")
 def health(): return {"status":"healthy","mt5": mt5_service.is_connected() or metaapi_service.is_connected(),"bot":bot_engine.bot_config["enabled"], "metaapi": metaapi_service.is_connected()}
 @app.get("/api/status")

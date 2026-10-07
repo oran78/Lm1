@@ -38,10 +38,10 @@ try:
 except Exception:
     _HAS_METAAPI_BOT = False
     _metaapi_bot = None
-from risk_engine import risk_engine
+from risk_engine import risk_engine, RISK_CAP_PREFIX
 from ownership import BOT_MAGIC, BOT_COMMENT, MANUAL_MAGIC, MANUAL_COMMENT, split_positions
 from market_context import htf_bias
-from strategy import analyze_symbol, plan_trade, break_even_sl
+from strategy import analyze_symbol, plan_trade, break_even_sl, MIN_RR
 
 logger = logging.getLogger("klop.bot")
 
@@ -152,8 +152,10 @@ bot_config = {
     "htf_mode": "counter",              # H1 bias filter: off | counter (block only trades AGAINST H1) | strict (H1 must agree; no H1 data = no trade)
     "structure_mode": "counter",        # M5 HH/HL-LH/LL filter: off | counter | strict
     "daily_loss_limit_enabled": True,   # switch for the daily-loss stop below (off = trade until max/day or target)
-    "max_daily_loss_pct": 8.0,          # stop for the UTC day once today's P/L <= -X% of balance
-    "risk_cap_pct": 20.0,               # per-trade ceiling: a trade whose real risk (min lot on a small account) exceeds this is blocked
+    "max_daily_loss_pct": 30.0,         # stop for the UTC day once today's P/L <= -X% of day-start balance (must be > risk_cap_pct or ONE loss ends the day)
+    "risk_cap_pct": 25.0,               # per-trade ceiling: a trade whose real risk (min lot on a small account) exceeds this is blocked
+    "tight_stop_fallback": True,        # small accounts: when the swing-based stop exceeds the cap, shrink the stop (inside the swing) until it fits
+    "min_sl_atr_mult": 0.5,             # ...but never tighter than this many ATR (and never tighter than 3 x the live spread)
 }
 
 bot_stats = {
@@ -161,6 +163,7 @@ bot_stats = {
     "consec_losses": 0, "cooldown_until": 0.0, "day_start_balance": None,
     "equity_curve": deque(maxlen=300), "log": deque(maxlen=100), "markers": deque(maxlen=120),
     "last_signal": "HOLD", "last_state": "WARMUP", "last_reason": "", "flip_progress": 0.0,
+    "last_block": None,            # {"time","signal","reason"} - why the last TRIGGERED signal did NOT become a trade (None after a trade opens)
     "planned_setup": None,         # {"side","entry_price","symbol","timeframe","candle_time","as_of"} or None
     "active_trade": None,          # {"ticket","side","lot","entry","sl","tp","be_active","profit","opened_at"} or None
     "today_start": datetime.now(timezone.utc).date().isoformat(),
@@ -226,7 +229,7 @@ def get_bot_state():
         "equity_curve": list(bot_stats["equity_curve"])[-60:], "log": list(bot_stats["log"])[-40:],
         "markers": list(bot_stats["markers"])[-40:], "last_signal": bot_stats["last_signal"],
         "last_state": bot_stats["last_state"],
-        "last_reason": bot_stats["last_reason"], "flip_progress": bot_stats["flip_progress"],
+        "last_reason": bot_stats["last_reason"], "last_block": bot_stats["last_block"], "flip_progress": bot_stats["flip_progress"],
         "target_balance": round(tgt, 2), "starting_balance": round(start, 2), "current_balance": round(bal, 2)}}
 
 def _sync_risk():
@@ -234,6 +237,7 @@ def _sync_risk():
     bot_config["risk_pct"] = min(max(float(bot_config["risk_pct"] or 1.0), 0.05), 50.0)
     bot_config["risk_cap_pct"] = min(max(float(bot_config["risk_cap_pct"] or 10.0), 0.5), 100.0)
     bot_config["max_daily_loss_pct"] = min(max(float(bot_config["max_daily_loss_pct"] or 0.0), 0.0), 100.0)
+    bot_config["min_sl_atr_mult"] = min(max(float(bot_config["min_sl_atr_mult"] or 0.5), 0.1), 5.0)
     risk_engine.max_risk_pct_hard = bot_config["risk_cap_pct"]
     risk_engine.max_daily_loss_pct = bot_config["max_daily_loss_pct"] if bot_config["daily_loss_limit_enabled"] else 0.0
 
@@ -264,6 +268,66 @@ def update_config(patch: dict):
         sb = bot_config["starting_balance"]
         if sb: bot_config["target_balance"] = round(sb * bot_config["target_multiplier"], 2)
     return get_bot_state()
+
+
+# ------------------------------------------------------------------ sizing: plan + lot that actually fit the account
+ENTRY_ATTEMPTS = 3          # order/account hiccups are retried this many times within the same candle, then the candle is dropped
+
+
+def _size_and_check(sig, entry, plan, balance, leverage, symbol, pnl_today):
+    """Lot + money-at-risk for `plan`, then the risk-engine gate. Returns (lot, risk_money, ok, why)."""
+    sl_dist = plan["risk"]
+    if bot_config["auto_lot"]:
+        lot, risk_money = risk_engine.calc_lot(balance, bot_config["risk_pct"], sl_dist)
+    else:
+        lot = float(bot_config["fixed_lot"]); risk_money = lot * risk_engine.contract_size * sl_dist
+    ok, why = risk_engine.can_trade(lot, symbol, balance=balance, sl_dist=sl_dist, price=entry,
+                                    leverage=leverage, pnl_today=pnl_today)
+    return lot, risk_money, ok, why
+
+
+def fit_plan_to_account(sig, entry, atr, swing_low, swing_high, balance, leverage, spread_px, symbol, pnl_today):
+    """Build SL/TP and size the lot so the trade passes the risk gate.
+
+    1) Normal plan: stop beyond the pullback swing (strategy.plan_trade).
+    2) If ONLY the per-trade risk cap blocks it (min lot 0.01 on a small account) and `tight_stop_fallback` is on:
+       shrink the stop step by step (0.1 ATR) down to `min_sl_atr_mult` (and >= 3 x live spread), IGNORING the swing
+       (the old retry kept the swing, so the stop never actually got tighter and the retry was a no-op). TP keeps the
+       configured R:R (>= MIN_RR) relative to the tighter stop.
+    Returns dict(plan, lot, risk_money, ok, why, note).
+    """
+    sl_cfg, tp_cfg = float(bot_config["sl_atr_mult"]), float(bot_config["tp_atr_mult"])
+    out = dict(plan=None, lot=0.0, risk_money=0.0, ok=False, why="", note=None)
+    plan, why = plan_trade(sig, entry, atr, swing_low, swing_high, sl_cfg, tp_cfg)
+    if not plan:
+        out["why"] = why; return out
+    lot, risk_money, ok, why = _size_and_check(sig, entry, plan, balance, leverage, symbol, pnl_today)
+    out.update(plan=plan, lot=lot, risk_money=risk_money, ok=ok, why=why)
+    if ok or not (bot_config["tight_stop_fallback"] and why.startswith(RISK_CAP_PREFIX)):
+        return out
+
+    floor = max(float(bot_config["min_sl_atr_mult"]), (3.0 * spread_px / atr) if atr > 0 else 0.0)
+    if floor >= sl_cfg - 1e-9:
+        out["why"] = why + f" — tight-stop fallback has no room (min stop {floor:.2f}×ATR ≥ SL×{sl_cfg})"; return out
+    ratio = max(tp_cfg / sl_cfg, MIN_RR)
+    mults, m = [], sl_cfg - 0.1
+    while m > floor + 1e-9:
+        mults.append(round(m, 3)); m -= 0.1
+    mults.append(round(floor, 3))
+    for mult in mults:
+        tplan, _ = plan_trade(sig, entry, atr, None, None, mult, round(mult * ratio, 4))   # swing ignored on purpose
+        if not tplan:
+            continue
+        tlot, trisk, tok, twhy = _size_and_check(sig, entry, tplan, balance, leverage, symbol, pnl_today)
+        if tok:
+            out.update(plan=tplan, lot=tlot, risk_money=trisk, ok=True, why="ok",
+                       note=f"small-account fit: stop {mult:.2f}×ATR (inside the pullback swing) → SL {tplan['sl']:.2f} "
+                            f"TP {tplan['tp']:.2f}, risk ${trisk:.2f} = {trisk / balance * 100:.1f}% of balance")
+            return out
+        out["why"] = twhy
+    out["why"] = (out["why"] + f" — even the tightest allowed stop ({floor:.2f}×ATR) is too big for this balance. "
+                  f"Raise 'Max risk cap' in the dashboard, lower 'Min stop', or add balance")
+    return out
 
 
 # ------------------------------------------------------------------ chart state (planned setup / active trade / markers)
@@ -409,6 +473,7 @@ async def _step(ctx):
     ct = result.get("candle_time")
     if ctx["last_candle"] is None and ct is not None:
         ctx["last_candle"] = ct                    # first pass after start/restart: that candle is already old — wait for the next close
+        ctx["entry_done"] = ct
         new_candle = False
     else:
         new_candle = ct is not None and ct != ctx["last_candle"]
@@ -428,78 +493,68 @@ async def _step(ctx):
     if not current and bot_stats["active_trade"]:
         bot_stats["active_trade"] = None
 
-    # ---- 5. entry: one per closed candle, flat only
-    if not new_candle or sig not in ("BUY", "SELL"):
-        if new_candle: ctx["last_candle"] = result.get("candle_time")
+    # ---- 5. entry: one decision per closed candle, flat only.
+    # A candle is only "spent" (ctx["entry_done"]) when the decision is final: trade opened, or blocked by a real rule.
+    # Transient trouble (no balance, broker order error) is retried a few times inside the same candle instead of
+    # silently losing the signal.
+    if new_candle:
+        ctx["last_candle"] = ct
+        ctx["attempts"] = 0
+    if sig not in ("BUY", "SELL") or ct is None or ct == ctx.get("entry_done"):
         return 2 if current else 4
-    ctx["last_candle"] = result["candle_time"]      # consume the candle, even if we end up skipping it
+
+    def _skip(reason, level="warn", delay=4, retry=False):
+        bot_stats["last_block"] = {"time": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), "signal": sig, "reason": reason}
+        _log(f"{sig} NOT opened — {reason}", level)
+        if retry:
+            ctx["attempts"] = ctx.get("attempts", 0) + 1
+            if ctx["attempts"] >= ENTRY_ATTEMPTS:
+                ctx["entry_done"] = ct
+                _log(f"{sig} dropped after {ENTRY_ATTEMPTS} attempts on this candle — waiting for the next setup", "warn")
+        else:
+            ctx["entry_done"] = ct
+        return delay
 
     if current:
-        _log(f"{sig} signal skipped — position already open", "info"); return 2
+        return _skip("a position is already open", "info", 2)
     if unknown:
-        _log(f"{sig} skipped — untagged position(s) on {symbol}; cannot tell whether they are the bot's", "warn"); return 4
+        return _skip(f"untagged position(s) on {symbol}; cannot tell whether they are the bot's", "warn", 4)
     if bot_stats["trades_today"] >= bot_config["max_trades_per_day"]:
-        _log("Max trades/day reached", "warn"); return 10
+        return _skip(f"max trades/day reached ({bot_config['max_trades_per_day']})", "warn", 10)
     if now_t < bot_stats["cooldown_until"]:
-        _log(f"{sig} skipped — cooling down after a loss ({int(bot_stats['cooldown_until'] - now_t)}s left)", "info"); return 4
+        return _skip(f"cooling down after a loss ({int(bot_stats['cooldown_until'] - now_t)}s left)", "info", 4)
 
     acc = await asyncio.to_thread(_any_account)
-    balance = float(acc["balance"]) if acc else 0.0
-    leverage = int(acc.get("leverage", 2000)) if acc else 2000
+    balance = float(acc["balance"]) if acc and acc.get("balance") else 0.0
+    if balance <= 0:
+        return _skip("account balance unavailable", "warn", 3, retry=True)
+    leverage = int(acc.get("leverage") or 2000)
     atr = result["atr"]
     entry = tick["ask"] if sig == "BUY" else tick["bid"]
-    plan, why = plan_trade(sig, entry, atr, result.get("swing_low"), result.get("swing_high"),
-                           bot_config["sl_atr_mult"], bot_config["tp_atr_mult"])
-    if not plan:
-        _log(f"{sig} skipped — {why}", "warn"); return 4
-    sl_dist, sl, tp = plan["risk"], plan["sl"], plan["tp"]
+    spread_px = max(float(tick["ask"]) - float(tick["bid"]), 0.0)
 
-    if bot_config["auto_lot"]:
-        lot, risk_money = risk_engine.calc_lot(balance, bot_config["risk_pct"], sl_dist)
-    else:
-        lot = float(bot_config["fixed_lot"]); risk_money = lot * risk_engine.contract_size * sl_dist
+    fit = fit_plan_to_account(sig, entry, atr, result.get("swing_low"), result.get("swing_high"),
+                              balance, leverage, spread_px, symbol, bot_stats["pnl_today"])
+    if not fit["ok"]:
+        return _skip(fit["why"], "warn", 6)
+    plan, lot, risk_money = fit["plan"], fit["lot"], fit["risk_money"]
+    sl, tp = plan["sl"], plan["tp"]
+    if fit["note"]:
+        _log(f"Adjusted for account size: {fit['note']}", "success")
 
-    eff_pct = risk_money / balance * 100.0 if balance > 0 else 0.0
+    eff_pct = risk_money / balance * 100.0
     if eff_pct > bot_config["risk_pct"] * 2:
         _log(f"⚠ min lot {lot} forces {eff_pct:.1f}% risk (setting is {bot_config['risk_pct']}%)", "warn")
-
-    ok, why = risk_engine.can_trade(lot, symbol, balance=balance, sl_dist=sl_dist, price=entry,
-                                    leverage=leverage, pnl_today=bot_stats["pnl_today"])
-    if not ok:
-        # SMALL-ACCOUNT FIX: 0.01 lot on gold (100 oz/lot) often risks more than the cap on a small
-        # balance, so a valid signal dies on a wide swing-based stop. Before giving up, retry with a
-        # progressively TIGHTER stop (down to 0.35 x ATR) and stretch TP to hold the R:R. A tight stop
-        # is exactly what a scalper wants anyway — this makes the bot actually trade instead of idling.
-        _log(f"{sig} risk-blocked ({why}) — retrying with a tighter stop to fit the account...", "info")
-        lowered = bot_config["sl_atr_mult"]
-        while lowered > 0.35:
-            lowered = round(max(0.30, lowered - 0.15), 4)
-            tplan, twhy = plan_trade(sig, entry, atr, result.get("swing_low"), result.get("swing_high"),
-                                     lowered, bot_config["tp_atr_mult"])
-            if not tplan:
-                continue
-            tlot = lot
-            tsl_dist = tplan["risk"]
-            tok, twhy2 = risk_engine.can_trade(tlot, symbol, balance=balance, sl_dist=tsl_dist,
-                                               price=entry, leverage=leverage, pnl_today=bot_stats["pnl_today"])
-            if tok:
-                lot, sl_dist, sl, tp = tlot, tsl_dist, tplan["sl"], tplan["tp"]
-                plan = tplan  # keep the log's R:R / SL / TP in sync with the tightened stop
-                ok, why = True, "tighter stop"
-                risk_money = tlot * risk_engine.contract_size * tsl_dist
-                _log(f"Adjusted stop for small account: SL×{lowered:.2f} → SL {sl:.2f} TP {tp:.2f} "
-                     f"(risk ${risk_money:.2f} = {risk_money/balance*100:.1f}%)", "success")
-                break
-        if not ok:
-            _log(f"Risk blocked {sig} {lot}: {why}", "warn"); return 6
 
     _log(f"{sig} [{result.get('setup')}] @ {entry:.2f} lot {lot} risk ${risk_money:.2f} "
          f"SL {sl:.2f} TP {tp:.2f} (R:R {plan['rr']}) • ATR {atr:.2f} RSI {result['rsi']} ({result['confidence']}%)", "info")
     order = await asyncio.to_thread(lambda: _any_send_order(symbol=symbol, action=sig, volume=lot, sl=sl, tp=tp,
                                                             magic=BOT_MAGIC, comment=BOT_COMMENT))
     if order.get("status") != "success":
-        _log(f"Order failed: {order.get('message')}", "error"); return 6
+        return _skip(f"broker rejected the order: {order.get('message')}", "error", 5, retry=True)
 
+    ctx["entry_done"] = ct
+    bot_stats["last_block"] = None
     bot_stats["trades_today"] += 1; risk_engine.register_trade(lot)
     ctx["risk"][str(order.get("ticket"))] = risk_money
     ctx["owned"].add(str(order.get("ticket")))
@@ -517,7 +572,7 @@ async def _step(ctx):
 
 async def _loop():
     _log("Pullback Scalper v2.6 started — EMA-zone rejection, 1 position max, auto break-even", "success")
-    ctx = {"last_candle": None, "tracked": {}, "be_retry": {}, "risk": {}, "owned": set()}
+    ctx = {"last_candle": None, "entry_done": None, "attempts": 0, "tracked": {}, "be_retry": {}, "risk": {}, "owned": set()}
     while bot_config["enabled"]:
         delay = 4
         try:

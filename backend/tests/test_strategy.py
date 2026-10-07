@@ -105,7 +105,8 @@ assert break_even_sl("SELL",4100.0,4102.4,4098.0,4098.2)is None
 assert break_even_sl("BUY",4100.0,0,4110,4110.3)is None                   # no SL -> nothing to move
 print("break-even OK")
 
-# --- risk maths
+# --- risk maths (the gate's mechanism is tested with explicit limits; the shipped defaults are 25% cap / 30% daily)
+risk_engine.max_risk_pct_hard = 10.0; risk_engine.max_daily_loss_pct = 8.0
 assert risk_engine.calc_lot(10,3,2.4)==(0.01,2.4)
 ok,why=risk_engine.can_trade(0.01,"XAUUSD",10,2.4,4100); assert not ok; print("$10 acct:",why)
 lot,rm=risk_engine.calc_lot(1000,1,3.0); print("$1000 @1%, SL $3 ->",lot,"lot risk $",rm); assert lot==0.03 and rm<=10
