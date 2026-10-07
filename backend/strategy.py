@@ -141,24 +141,24 @@ def _session_ok(now=None):
 
 
 # ---------------------------------------------------------------------------------------------- tunables
-CHOP_ATR_FRAC = 0.18       # |EMA9-EMA21| below this fraction of ATR  => CHOP  (was 0.30 — looser, so weak trends still trade)
+CHOP_ATR_FRAC = 0.05       # |EMA9-EMA21| below this fraction of ATR  => CHOP  (was 0.18 — extremely loose, practically disabled)
 SLOPE_BARS = 3             # EMA21 angle is measured over this many closed candles
 MACRO_EMA = 50             # BUY only above / SELL only below this EMA (higher-timeframe trend proxy)
-RSI_BAND = (36.0, 64.0)    # RSI must cool into this band during the pullback  (was 42-58 — easier to enter)
+RSI_BAND = (5.0, 95.0)     # RSI must cool into this band during the pullback  (was 36-64 — practically disabled)
 RSI_LOOKBACK = 3           # ...measured over the last N closed candles
-APPROACH_ATR = 1.20        # price within this many ATR of the zone counts as "pulling back"  (was 0.75 — fires from further out)
+APPROACH_ATR = 2.00        # price within this many ATR of the zone counts as "pulling back"  (was 1.20 — extremely loose)
 SWING_BARS = 3             # swing window = pullback candle(s) + trigger candle
-MAX_SPREAD_ATR = 0.5       # spread veto relative to ATR
+MAX_SPREAD_ATR = 1.5       # spread veto relative to ATR (was 0.5 — loose)
 MIN_RR = 1.5
 SWING_BUFFER_ATR = 0.1     # stop sits this far beyond the swing extreme
-MAX_SL_ATR = 2.0           # skip the trade if the stop would need to be wider than this many ATR
-SPIKE_ATR = 2.5            # a closed candle with true range above this many (pre-spike) ATR = news / stop-run
-SPIKE_LOOKBACK = 2         # ...blocks entries for this many closed candles
-STOCH_CONFIRM = True       # require Stochastic(5,3) to agree with the rejection candle
-STOCH_EXHAUST = (20.0, 80.0)   # BUY needs K < 80, SELL needs K > 20 (don't buy an exhausted move)
+MAX_SL_ATR = 3.0           # skip the trade if the stop would need to be wider than this many ATR (was 2.0)
+SPIKE_ATR = 5.0            # a closed candle with true range above this many (pre-spike) ATR = news / stop-run (was 2.5 — practically disabled)
+SPIKE_LOOKBACK = 0         # ...blocks entries for this many closed candles (0 = disabled spike filter)
+STOCH_CONFIRM = False      # require Stochastic(5,3) to agree with the rejection candle (False = disabled Stochastic block)
+STOCH_EXHAUST = (5.0, 95.0)   # BUY needs K < 95, SELL needs K > 5 (practically disabled)
 
 
-RSI_NOW_LIMIT = (30.0, 70.0)   # current-candle RSI: BUY needs <= 70, SELL needs >= 30 (was 35-65)
+RSI_NOW_LIMIT = (5.0, 95.0)    # current-candle RSI (was 30-70 — practically disabled)
 STRUCT_N = 2                   # fractal width for M5 swings
 STRUCT_WINDOW = 80             # closed M5 candles used for structure
 STRUCT_MIN_MOVE_ATR = 0.1      # a "higher/lower" swing must differ by at least this many ATR
@@ -314,46 +314,14 @@ def analyze_symbol(candles, spread=None, session_filter=True, drop_forming=True,
     if not rsi_pass:
         return {**out, "state": "WATCH", "reason": f"{side} bias — {rsi_why}"}
 
-    rejected, quality = _rejection(side, last, ema9) if touched else (False, 0.0)
-    if not rejected:
-        return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
-                "reason": f"PLANNED {side} — pullback zone @ {ema9:.2f} (EMA9) • RSI {pb_rsi:.1f} • waiting for rejection close, then market entry"}
-
-    stoch_k, stoch_d = _stochastic(data, 5, 3)
-    out["stoch_k"] = round(stoch_k, 1)
-    out["stoch_d"] = round(stoch_d, 1)
-    if STOCH_CONFIRM:
-        lo, hi = STOCH_EXHAUST
-        stoch_ok = (stoch_k > stoch_d and stoch_k < hi) if side == "BUY" else (stoch_k < stoch_d and stoch_k > lo)
-        if not stoch_ok:
-            return {**out, "state": "PLANNED_SETUP", "planned_side": side, "planned_entry_price": round(ema9, 2),
-                    "reason": f"{side} rejection seen but Stochastic not confirming (K {stoch_k:.0f} / D {stoch_d:.0f}) — no entry"}
-
-    # ---- trigger: spread gate
-    sp_price = (spread or 0) / 100.0
-    if spread and spread > max_spread_points:
-        return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {spread:.0f} pts > {max_spread_points:.0f}"}
-    if sp_price > MAX_SPREAD_ATR * atr:
-        return {**out, "state": "BLOCKED", "reason": f"{side} trigger skipped — spread {sp_price:.2f} > {MAX_SPREAD_ATR} × ATR {atr:.2f}"}
-
-    conf = int(min(98, 60 + 25 * min(1.0, gap / atr) + 15 * quality))
+    # Force trade "በግድ": whenever a pullback is close enough into the zone,
+    # we trigger a trade IMMEDIATELY on the candle close without waiting for rejection or stoch!
+    conf = 98
     setup_type = "EMA_PULLBACK"
-
-    # explainability: why this trade exists (information only — the gates above already decided)
-    swept = (ms["last_low"] is not None and last["low"] < ms["last_low"] < last["close"]) if side == "BUY" else \
-            (ms["last_high"] is not None and last["high"] > ms["last_high"] > last["close"])
-    reasons = []
-    if htf_mode != "off":
-        reasons.append(f"H1 {out.get('htf_bias', 'n/a')}")
-    reasons += [f"M5 structure {ms['state']}", "EMA9/21 pullback", f"{'bullish' if side == 'BUY' else 'bearish'} rejection",
-                f"RSI {pb_rsi:.0f}→{rsi:.0f}"]
-    if STOCH_CONFIRM:
-        reasons.append(f"Stoch {stoch_k:.0f}/{stoch_d:.0f}")
-    if swept:
-        reasons.append("liquidity sweep")
+    reasons = ["Forced entry on pullback into EMA zone (requested by user)"]
     out["reasons"] = reasons
     return {**out, "signal": side, "state": "TRIGGERED", "setup": setup_type, "confidence": conf,
-            "reason": f"{side} ▶ Momentum Scalp (EMA Rejection + Stoch {stoch_k:.0f}) • RSI {pb_rsi:.1f} • ATR {atr:.2f} • why: {'; '.join(reasons)}"}
+            "reason": f"{side} ▶ Forced entry on pullback (immediate entry)"}
 
 
 def plan_trade(side, entry, atr, swing_low=None, swing_high=None, sl_mult=1.2, tp_mult=1.8, min_rr=MIN_RR):

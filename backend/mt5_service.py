@@ -138,7 +138,7 @@ class MT5Service:
         self._password = password
         self._last_error = None
 
-        # 1b. Try BRIDGE (Windows) first if BRIDGE_URL set — REAL without Wine
+        # ---- 1b. Try BRIDGE (Windows) first if BRIDGE_URL set — REAL without Wine
         if _get_bridge_url() or BRIDGE_URL:
             try:
                 import httpx

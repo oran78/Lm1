@@ -140,17 +140,17 @@ bot_config = {
     "sl_atr_mult": 1.2,            # SL distance = 1.2 x ATR (pushed beyond the pullback swing when further away)
     "tp_atr_mult": 1.8,            # TP distance = 1.8 x ATR  -> R:R 1.5
     "timeframe": "M5",
-    "session_filter": True,
+    "session_filter": False,            # Default to False so it trades 24/7 in all sessions
     "max_hold_candles": 12,        # time-stop: close a trade that goes nowhere after N candles
     "close_on_opposite": True,
-    "max_spread_points": 35,       # absolute spread cap (points = price*100); strategy also caps at 0.5 x ATR
+    "max_spread_points": 50,       # absolute spread cap (points = price*100) (was 35 — looser)
     "be_enabled": True,            # auto break-even
     "be_trigger_r": 1.0,           # move SL to entry +/- spread when floating profit >= 1 x initial risk
     "cooldown_candles_after_loss": 1,   # skip this many candles after a loss (was 2 — re-enter faster)
     "loss_streak_trigger": 3,           # N losses in a row -> take the longer break below (0 = off); trading then resumes
     "loss_streak_cooldown_candles": 4,  # ...skip this many candles (was 6 — M5: ~20 min, rebounded sooner)
-    "htf_mode": "counter",              # H1 bias filter: off | counter (block only trades AGAINST H1) | strict (H1 must agree; no H1 data = no trade)
-    "structure_mode": "counter",        # M5 HH/HL-LH/LL filter: off | counter | strict
+    "htf_mode": "off",                  # H1 bias filter: default to OFF so it doesn't block trades
+    "structure_mode": "off",            # M5 structure filter: default to OFF so it doesn't block trades
     "daily_loss_limit_enabled": True,   # switch for the daily-loss stop below (off = trade until max/day or target)
     "max_daily_loss_pct": 30.0,         # stop for the UTC day once today's P/L <= -X% of day-start balance (must be > risk_cap_pct or ONE loss ends the day)
     "risk_cap_pct": 25.0,               # per-trade ceiling: a trade whose real risk (min lot on a small account) exceeds this is blocked
